@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.6
+telethon>=1.36
+aiohttp>=3.9
+cryptography>=42
+PySocks>=1.7.1
+python-dotenv>=1.0
