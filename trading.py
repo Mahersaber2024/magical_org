@@ -50,7 +50,7 @@ def g2j(gy: int, gm: int, gd: int):
 def fa_date(dt: datetime = None) -> str:
     dt = dt or datetime.now(ZoneInfo(TIMEZONE))
     jy, jm, jd = g2j(dt.year, dt.month, dt.day)
-    return f"📅 {_DAYS[dt.weekday()]} | {to_fa(jd)} {_MONTHS[jm - 1]} {to_fa(jy)}"
+    return f"{_DAYS[dt.weekday()]} {to_fa(jd)} {_MONTHS[jm - 1]} {to_fa(jy)}"
 
 
 def fmt_price(x: float) -> str:
@@ -197,80 +197,76 @@ async def get_price(pair: str):
 
 e = html.escape
 
+LINE = "──────────────"
+
 
 def _head(t):
-    return f"{e(t['symbol'])} — {t['side']}"
+    return f"{e(t['symbol'])} {t['side']}"
+
+
+def order_type(side: str, entry: float, price: float) -> str:
+    """'limit' if Entry is on the better side of the market, else 'stop'."""
+    if side == "LONG":
+        return "limit" if entry <= price else "stop"
+    return "limit" if entry >= price else "stop"
+
+
+def _pending_kind(t):
+    """(emoji, label): blue = Limit, yellow = Stop. Old trades without a type stay yellow."""
+    kind = t.get("order")
+    if kind not in ("limit", "stop"):
+        return "🟡", "Pending"
+    emoji = "🔵" if kind == "limit" else "🟡"
+    side = "Buy" if t["side"] == "LONG" else "Sell"
+    return emoji, f"Pending {side} {kind.capitalize()}"
 
 
 def pending_text(t):
+    emoji, label = _pending_kind(t)
     return (
-        f"{fa_date()}\n"
-        f"🟡 <b>LIVE TRADE {_head(t)}</b> | Pending\n\n"
-        f"📍 Entry: {fmt_price(t['entry'])}\n"
-        f"🎯 Take Profit: {fmt_price(t['tp'])}\n"
-        f"🛑 Stop Loss: {fmt_price(t['sl'])}\n"
-        f"⚖️ Risk/Reward: {fmt_rr(t['rr'])}"
+        f"{emoji} <b>{_head(t)}</b>  ·  {label}\n"
+        f"{LINE}\n"
+        f"Entry   {fmt_price(t['entry'])}\n"
+        f"TP   {fmt_price(t['tp'])}\n"
+        f"SL   {fmt_price(t['sl'])}\n"
+        f"R/R   {fmt_rr(t['rr'])}\n"
+        f"{LINE}\n"
+        f"{fa_date()}"
     )
 
+
+# Replies carry no date: they are short status lines under the original post.
 
 def open_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"🟢 <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"✅ Position Opened Successfully"
-    )
+    return f"🟢 Position {t['no']}  ·  Opened"
 
 
 def cancel_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"⚪️ <b>LIVE TRADE {_head(t)}</b>\n\n"
-        f"❌ Pending Order Cancelled"
-    )
+    return "⚪️ Pending order cancelled"
 
 
 def reward_text(t, step):
-    return (
-        f"{fa_date()}\n"
-        f"🏆 <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"💰 Reward {fmt_step(step)} reached — In Profit ✅"
-    )
+    return f"🟢 Position {t['no']}  ·  Reward {fmt_step(step)}  ·  In Profit"
 
 
 def tp_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"🎯 <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"✅ Take Profit Hit\n"
-        f"💎 Result: <b>{fmt_r(t['result_r'])}</b>"
-    )
+    return f"🟢 Position {t['no']}  ·  Take Profit  ·  <b>{fmt_r(t['result_r'])}</b>"
 
 
 def sl_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"🔴 <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"🛑 Stop Loss Hit\n"
-        f"📉 Result: <b>{fmt_r(t['result_r'])}</b>"
-    )
+    return f"🔴 Position {t['no']}  ·  Stop Loss  ·  <b>{fmt_r(t['result_r'])}</b>"
 
 
 def be_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"⚪️ <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"🛡 Closed at Break-even\n"
-        f"Result: <b>0R</b>"
-    )
+    return f"⚪️ Position {t['no']}  ·  Break-even  ·  <b>0R</b>"
+
+
+def be_set_text(t):
+    return f"⚪️ Position {t['no']}  ·  Stop moved to Entry  ·  Risk-free"
 
 
 def manual_text(t):
-    return (
-        f"{fa_date()}\n"
-        f"🔒 <b>LIVE TRADE — POSITION {t['no']}</b>\n\n"
-        f"Position Closed Manually\n"
-        f"Result: <b>{fmt_r(t['result_r'])}</b>"
-    )
+    return f"⚪️ Position {t['no']}  ·  Closed manually  ·  <b>{fmt_r(t['result_r'])}</b>"
 
 
 def final_text(t):
@@ -278,7 +274,7 @@ def final_text(t):
 
 
 def summary_text(trades):
-    lines = [f"📊 <b>PERFORMANCE REPORT</b>", fa_date(), "━━━━━━━━━━━━━━", ""]
+    lines = ["<b>Performance Report</b>", LINE]
     total = 0.0
     wins = losses = be = 0
     counts = {}
@@ -287,24 +283,25 @@ def summary_text(trades):
         total += r
         if r > 0.005:
             wins += 1
-            mark = "✅"
+            mark = "🟢"
         elif r < -0.005:
             losses += 1
-            mark = "❌"
+            mark = "🔴"
         else:
             be += 1
             mark = "⚪️"
-        for s in t["rewards_hit"]:
-            counts[s] = counts.get(s, 0) + 1
-        hit = " · ".join(fmt_step(s) for s in sorted(t["rewards_hit"]))
-        extra = f"  (🏆 {hit})" if hit else ""
-        lines.append(f"▫️ {e(t['symbol'])} {t['side']} ➜ {mark} <b>{fmt_r(r)}</b>{extra}")
+        for st in t["rewards_hit"]:
+            counts[st] = counts.get(st, 0) + 1
+        hit = " · ".join(fmt_step(st) for st in sorted(t["rewards_hit"]))
+        extra = f"   ({hit})" if hit else ""
+        lines.append(f"{mark} {e(t['symbol'])} {t['side']}   <b>{fmt_r(r)}</b>{extra}")
     n = len(trades)
-    lines += ["", "━━━━━━━━━━━━━━",
-              f"💎 Total Result: <b>{fmt_r(total)}</b>",
-              f"✅ Wins: {wins}  |  ❌ Losses: {losses}  |  ⚪️ BE: {be}",
-              f"🎯 Win Rate: {round(wins / n * 100)}%"]
+    lines += [LINE,
+              f"Total   <b>{fmt_r(total)}</b>",
+              f"Wins {wins}  ·  Losses {losses}  ·  BE {be}",
+              f"Win rate   {round(wins / n * 100)}%"]
     if counts:
-        rw = " · ".join(f"{fmt_step(s)}×{c}" for s, c in sorted(counts.items()))
-        lines.append(f"🏆 Rewards Collected: {rw}")
+        rw = " · ".join(f"{fmt_step(st)}×{c}" for st, c in sorted(counts.items()))
+        lines.append(f"Rewards   {rw}")
+    lines += [LINE, fa_date()]
     return "\n".join(lines)

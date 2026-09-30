@@ -61,7 +61,7 @@ DEFAULTS = {
     "trades": [],
     "admins": [],
     "trade_counter": 0,
-    "settings": {"reward_steps": [1, 2, 3], "be_after": 0, "poll_seconds": 5},
+    "settings": {"reward_on": True, "reward_every": 1, "be_after": 0, "poll_seconds": 5},
 }
 
 _data = None
@@ -75,6 +75,9 @@ def db() -> dict:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
         _data = loaded
+        st = _data.get("settings", {})
+        if "reward_every" not in st and st.get("reward_steps"):  # migrate old list -> interval
+            st["reward_every"] = float(min(st["reward_steps"]))
         for k, v in DEFAULTS.items():
             _data.setdefault(k, copy.deepcopy(v))
         for k, v in DEFAULTS["settings"].items():
@@ -127,6 +130,21 @@ def active_trades(channel_key: str = None) -> list:
             and (channel_key is None or t["channel"] == channel_key)]
 
 
+def reward_steps(every, rr) -> list:
+    """Reward levels every `every` R, below the TP level (max 30 levels)."""
+    try:
+        every = float(every)
+    except (TypeError, ValueError):
+        return []
+    if every <= 0:
+        return []
+    out, k = [], 1
+    while every * k < rr - 1e-9 and k <= 30:
+        out.append(round(every * k, 4))
+        k += 1
+    return out
+
+
 def create_trade(draft: dict, channel: dict) -> dict:
     d = db()
     d["trade_counter"] += 1
@@ -137,7 +155,7 @@ def create_trade(draft: dict, channel: dict) -> dict:
         "no": channel["counter"],
         "channel": channel["key"],
         "status": "pending",
-        "steps": sorted(float(x) for x in s["reward_steps"]),
+        "steps": reward_steps(s["reward_every"], draft["rr"]),
         "be_after": float(s["be_after"]),
         "be_active": False,
         "rewards_hit": [],
@@ -149,7 +167,7 @@ def create_trade(draft: dict, channel: dict) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "last_price": draft["price"],
     }
-    for k in ("pair", "symbol", "side", "entry", "tp", "sl", "rr"):
+    for k in ("pair", "symbol", "side", "entry", "tp", "sl", "rr", "order"):
         t[k] = draft[k]
     d["trades"].append(t)
     save()
@@ -185,18 +203,22 @@ def admin_only(fn):
 LOCK = asyncio.Lock()
 esc = html.escape
 
-SIGNAL_FORMAT = "<code>btc\nInt81000\nTp87000\nSl80000</code>"
+# <pre> block: one tap copies the whole template in Telegram.
+SIGNAL_FORMAT = "<pre>BTC\nInt\nTp\nSl</pre>"
+SIGNAL_EXAMPLE = "<pre>btc\nInt81000\nTp87000\nSl80000</pre>"
 
 HELP = (
     "📖 <b>راهنما</b>\n\n"
     "<b>ارسال سیگنال</b>\n"
-    "پیام را با این قالب بفرست:\n\n"
-    f"{SIGNAL_FORMAT}\n\n"
+    "قالب را با یک لمس کپی کن، عددها را بنویس و بفرست:\n"
+    f"{SIGNAL_FORMAT}\n"
+    "نمونه:\n"
+    f"{SIGNAL_EXAMPLE}\n"
     "• <code>Int</code> = Entry ، <code>Tp</code> = Take Profit ، <code>Sl</code> = Stop Loss\n"
     "• جهت (LONG/SHORT) و Risk/Reward خودکار محاسبه می‌شود.\n"
     "• پیش‌نمایش می‌آید؛ کانال را انتخاب کن تا خود بات در آن کانال پست بگذارد.\n• بات باید در کانال <b>ادمین</b> با دسترسی «ارسال پست» باشد.\n\n"
     "<b>چرخه‌ی معامله</b>\n"
-    "🟡 Pending ← 🟢 Position Opened ← 🏆 Reward ها ← 🎯 TP / 🛑 SL\n"
+    "Pending ← Position Opened ← Reward ها ← TP / SL\n"
     "همه‌ی مراحل به‌صورت ریپلای روی پست اصلی ارسال می‌شوند.\n\n"
     "<b>مدیریت</b>\n"
     "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند."
@@ -274,13 +296,13 @@ async def reset_flow(ud: dict):
 async def view_home(update):
     pend, opn, unrep = _counts()
     text = (
-        f"🏠 <b>{BOT_NAME}</b> · پنل مدیریت\n"
-        "━━━━━━━━━━━━━━\n"
-        f"📋 معاملات فعال: <b>{pend + opn}</b>  (🟡 {pend} · 🟢 {opn})\n"
+        f"<b>{BOT_NAME}</b> · پنل مدیریت\n\n"
+        "<blockquote>"
+        f"📋 معاملات فعال: <b>{pend + opn}</b>  ({pend} Pending · {opn} Open)\n"
         f"📊 گزارش‌نشده: <b>{unrep}</b>\n"
-        f"📺 کانال‌ها: <b>{len(channels())}</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        "برای ارسال سیگنال، پیام را در این قالب بفرست:\n\n"
+        f"📺 کانال‌ها: <b>{len(channels())}</b>"
+        "</blockquote>\n\n"
+        "📝 <b>قالب سیگنال</b> (با یک لمس کپی می‌شود)\n"
         f"{SIGNAL_FORMAT}"
     )
     await show(update, text, home_kb())
@@ -308,8 +330,8 @@ async def view_channels(update):
 async def view_trades(update, page: int = 0):
     active = active_trades()
     if not active:
-        await show(update, "📋 <b>معاملات فعال</b>\n\nمعامله‌ی فعالی وجود ندارد.",
-                   M([[B("🔄 بروزرسانی", "trp:0"), B("🏠 منو", "menu:home")]]))
+        await show(update, "<b>معاملات فعال</b>\n\nمعامله‌ی فعالی وجود ندارد.",
+                   M([[B("بروزرسانی", "trp:0"), B("منو", "menu:home")]]))
         return
     per = 5
     pages = (len(active) + per - 1) // per
@@ -319,32 +341,48 @@ async def view_trades(update, page: int = 0):
     res = await asyncio.gather(*(trading.get_price(p) for p in pairs))
     prices = dict(zip(pairs, res))
 
-    lines = [f"📋 <b>معاملات فعال</b> ({len(active)})\n"]
+    sep = "┈┈┈┈┈┈┈┈┈┈┈┈"
+    blocks = [f"<b>معاملات فعال</b>  ·  {len(active)}"]
     kb = []
     for t in chunk:
-        st = "🟡 Pending" if t["status"] == "pending" else "🟢 Open"
-        hit = ""
-        if t["rewards_hit"]:
-            hit = " | 🏆 " + ",".join(fmt_step(s) for s in sorted(t["rewards_hit"]))
+        is_open = t["status"] == "open"
+        arrow = "↑" if t["side"] == "LONG" else "↓"
         cur = prices.get(t["pair"])
-        now = ""
-        if cur is not None:
-            now = f"\n   💵 الان: {fmt_price(cur)}"
-            if t["status"] == "open":
-                risk = abs(t["entry"] - t["sl"])
-                d = 1 if t["side"] == "LONG" else -1
-                now += f" ({fmt_r(d * (cur - t['entry']) / risk)})"
-        lines.append(f"<b>#{t['id']}</b> {esc(t['symbol'])} {t['side']} — {st}{hit}\n"
-                     f"   Entry {fmt_price(t['entry'])} | TP {fmt_price(t['tp'])} | SL {fmt_price(t['sl'])}{now}")
-        if t["status"] == "pending":
-            kb.append([B(f"❌ کنسل #{t['id']}", f"tr:cancel:{t['id']}")])
+        r = None
+        if cur is not None and is_open:
+            risk = abs(t["entry"] - t["sl"])
+            d = 1 if t["side"] == "LONG" else -1
+            r = d * (cur - t["entry"]) / risk
+
+        # header + status
+        status = "Open" if is_open else "Pending"
+        if is_open and r is not None:
+            status += f"  ·  <b>{fmt_r(r)}</b>"
+        head = f"<b>#{t['id']}  {esc(t['symbol'])} {t['side']}</b>  ·  {status}"
+
+        # body
+        body = [f"Entry {fmt_price(t['entry'])}   TP {fmt_price(t['tp'])}   SL {fmt_price(t['sl'])}"]
+        now = f"Now {fmt_price(cur)}" if cur is not None else "Now  —"
+        if t["rewards_hit"]:
+            now += "   ·   " + " ".join(fmt_step(s) for s in sorted(t["rewards_hit"]))
+        if t.get("be_active"):
+            now += "   ·   BE"
+        body.append(now)
+        blocks.append(head + "\n" + "\n".join(body))
+
+        # buttons: [name] [break-even] [close / cancel]
+        name = B(f"#{t['id']} {t['symbol']} {arrow}", "noop")
+        if is_open:
+            be = (B("BE ✓", "noop") if t.get("be_active")
+                  else B("Break-even", f"tr:be:{t['id']}"))
+            kb.append([name, be, B("Close", f"tr:close:{t['id']}")])
         else:
-            kb.append([B(f"🔒 بستن دستی #{t['id']}", f"tr:close:{t['id']}")])
+            kb.append([name, B("·", "noop"), B("Cancel", f"tr:cancel:{t['id']}")])
     if pages > 1:
-        kb.append([B("⬅️", f"trp:{max(page - 1, 0)}"), B(f"{page + 1}/{pages}", "noop"),
-                   B("➡️", f"trp:{min(page + 1, pages - 1)}")])
-    kb.append([B("🔄 بروزرسانی", f"trp:{page}"), B("🏠 منو", "menu:home")])
-    await show(update, "\n\n".join(lines[:1]) + "\n" + "\n\n".join(lines[1:]), M(kb))
+        kb.append([B("‹", f"trp:{max(page - 1, 0)}"), B(f"{page + 1}/{pages}", "noop"),
+                   B("›", f"trp:{min(page + 1, pages - 1)}")])
+    kb.append([B("بروزرسانی", f"trp:{page}"), B("منو", "menu:home")])
+    await show(update, ("\n" + sep + "\n").join(blocks), M(kb))
 
 
 async def view_stats(update):
@@ -357,37 +395,42 @@ async def view_stats(update):
     losses = sum(1 for r in rs if r < -0.005)
     be = len(rs) - wins - losses
     total = sum(rs)
-    lines = [
-        "📈 <b>آمار کلی</b>",
-        "━━━━━━━━━━━━━━",
-        f"📦 کل معاملات بسته‌شده: <b>{len(rs)}</b>",
-        f"💎 مجموع نتیجه: <b>{fmt_r(total)}</b>  (میانگین {fmt_r(total / len(rs))})",
-        f"✅ {wins}  |  ❌ {losses}  |  ⚪️ {be}",
+    body = [
+        f"📦 معاملات بسته‌شده: <b>{len(rs)}</b>",
+        f"💎 مجموع: <b>{fmt_r(total)}</b>  (میانگین {fmt_r(total / len(rs))})",
         f"🎯 Win Rate: <b>{round(wins / len(rs) * 100)}%</b>",
-        f"🥇 بهترین: {fmt_r(max(rs))}   🥀 بدترین: {fmt_r(min(rs))}",
+        f"✅ {wins}  ·  ❌ {losses}  ·  ⚪️ {be}",
+        f"🥇 بهترین: {fmt_r(max(rs))}  ·  🥀 بدترین: {fmt_r(min(rs))}",
     ]
+    lines = ["📈 <b>آمار کلی</b>", "", "<blockquote>" + "\n".join(body) + "</blockquote>"]
     per_ch = []
     for c in channels():
         rows = [t["result_r"] for t in closed if t["channel"] == c["key"]]
         if rows:
             per_ch.append(f"• {esc(c['title'])}: {len(rows)} معامله · <b>{fmt_r(sum(rows))}</b>")
     if per_ch:
-        lines += ["", "📺 <b>به تفکیک کانال</b>"] + per_ch
+        lines += ["", "📺 <b>به تفکیک کانال</b>", "<blockquote>" + "\n".join(per_ch) + "</blockquote>"]
     await show(update, "\n".join(lines), back_kb())
 
 
 async def view_settings(update):
     s = settings()
-    steps = ", ".join(fmt_step(x) for x in s["reward_steps"]) or "—"
-    be = fmt_step(s["be_after"]) if s["be_after"] else "غیرفعال"
+    if s["reward_on"]:
+        rw = f"هر {fmt_step(s['reward_every'])}"
+    else:
+        rw = "خاموش"
+    be = f"بعد از {fmt_step(s['be_after'])}" if s["be_after"] else "خاموش"
     text = (
         "⚙️ <b>تنظیمات</b>\n\n"
-        f"🏆 پله‌های ریوارد: <b>{steps}</b>\n"
-        f"🛡 انتقال SL به Entry بعد از: <b>{be}</b>\n"
-        f"⏱ فاصله‌ی چک قیمت: <b>{s['poll_seconds']} ثانیه</b>"
+        "<blockquote>"
+        f"🏆 پست ریوارد: <b>{rw}</b>\n"
+        f"🛡 انتقال SL به Entry: <b>{be}</b>\n"
+        f"⏱ چک قیمت: <b>هر {s['poll_seconds']} ثانیه</b>"
+        "</blockquote>"
     )
+    tog = "🔕 خاموش کردن ریوارد" if s["reward_on"] else "🔔 روشن کردن ریوارد"
     kb = M([
-        [B("🏆 پله‌های ریوارد", "set:rewards")],
+        [B("🏆 فاصله‌ی ریوارد", "set:rewards"), B(tog, "set:rewtoggle")],
         [B("🛡 Break-even", "set:be"), B("⏱ فاصله‌ی چک", "set:poll")],
         [B("🏠 منو", "menu:home")],
     ])
@@ -458,16 +501,19 @@ async def view_status(update):
     cancelled = sum(1 for t in tr if t["status"] == "cancelled")
     tick = f"{int(time.time() - LAST_TICK)} ثانیه پیش" if LAST_TICK else "—"
     text = (
-        "🖥 <b>وضعیت سیستم</b>\n"
-        "━━━━━━━━━━━━━━\n"
+        "🖥 <b>وضعیت سیستم</b>\n\n"
+        "<blockquote>"
         f"⏱ Uptime: <b>{uptime_str(time.time() - START_TS)}</b>\n"
         f"🐍 Python {sys.version_info.major}.{sys.version_info.minor} · PTB {PTB_VERSION}\n"
         f"📡 API قیمت: {api}\n"
-        f"🔁 آخرین چک قیمت: {tick}  (هر {settings()['poll_seconds']} ثانیه)\n"
-        "━━━━━━━━━━━━━━\n"
-        f"📋 فعال: {pend + opn} (🟡 {pend} · 🟢 {opn})\n"
-        f"📦 بسته‌شده: {closed} (گزارش‌نشده {unrep}) · ❌ کنسل: {cancelled}\n"
-        f"📺 کانال‌ها: {len(channels())}"
+        f"🔁 آخرین چک: {tick} (هر {settings()['poll_seconds']} ثانیه)"
+        "</blockquote>\n\n"
+        "<blockquote>"
+        f"📋 فعال: <b>{pend + opn}</b> ({pend} Pending · {opn} Open)\n"
+        f"📦 بسته‌شده: <b>{closed}</b> (گزارش‌نشده {unrep})\n"
+        f"🚫 کنسل‌شده: <b>{cancelled}</b>\n"
+        f"📺 کانال‌ها: <b>{len(channels())}</b>"
+        "</blockquote>"
     )
     await show(update, text, M([[B("🔄 بروزرسانی", "adm:status"), B("⬅️ پنل ادمین", "adm:home")]]))
 
@@ -574,16 +620,18 @@ async def handle_state(update, context, st, text):
                   M([[B("👥 ادمین‌ها", "adm:list"), B("🏠 منو", "menu:home")]]))
     elif st == "set_rewards":
         try:
-            steps = sorted({float(x) for x in re.split(r"[,\s،]+", text) if x})
-            if not steps or any(x <= 0 for x in steps):
+            v = float(text.translate(trading._DIGITS).replace(",", "."))
+            if not 0.25 <= v <= 50:
                 raise ValueError
         except ValueError:
-            await say(update, "❌ مثل این بفرست: <code>1,2,3</code> یا <code>0.5,1,2</code>", cancel_kb())
+            await say(update, "❌ فقط یک عدد بین 0.25 تا 50 بفرست. مثلاً <code>1</code> یا <code>2</code>",
+                      cancel_kb())
             return
-        settings()["reward_steps"] = steps
+        settings()["reward_every"] = v
+        settings()["reward_on"] = True
         save()
         ud.pop("state")
-        await say(update, "✅ ذخیره شد (روی معاملات بعدی اعمال می‌شود).",
+        await say(update, f"✅ از این به بعد هر <b>{fmt_step(v)}</b> ریوارد پست می‌شود.",
                   M([[B("⚙️ تنظیمات", "menu:settings"), B("🏠 منو", "menu:home")]]))
     elif st == "set_be":
         try:
@@ -622,6 +670,7 @@ async def handle_signal(update, context, text):
                   back_kb())
         return
     parsed["price"] = price
+    parsed["order"] = trading.order_type(parsed["side"], parsed["entry"], price)
     context.user_data["draft"] = parsed
     kb = [[B(f"📤 پست در {c['title']}", f"sig:post:{c['key']}")] for c in channels()]
     kb.append([B("✖️ لغو", "sig:cancel")])
@@ -781,25 +830,30 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif a == "tr":
         tid = int(p[2])
         t = get_trade(tid)
-        if p[1] in ("cancel", "close"):
-            if not t or t["status"] not in ("pending", "open"):
-                await view_trades(update)
-                return
-            what = "کنسل" if p[1] == "cancel" else "به‌صورت دستی بسته"
-            await show(update, f"⚠️ معامله‌ی <b>#{tid}</b> ({esc(t['symbol'])} {t['side']}) {what} شود؟\n"
-                               "پیام مربوطه در کانال ارسال می‌شود.",
-                       confirm_kb(f"tr:{p[1]}ok:{tid}", "trp:0"))
-            return
         async with LOCK:
             ch = t and get_channel(t["channel"])
             if not t or not ch:
                 await view_trades(update)
                 return
             try:
-                if p[1] == "cancelok" and t["status"] == "pending":
+                if p[1] == "cancel" and t["status"] == "pending":
                     await _post(ch, trading.cancel_text(t), t["pending_msg_id"])
                     t["status"] = "cancelled"
-                elif p[1] == "closeok" and t["status"] == "open":
+                elif p[1] == "be" and t["status"] == "open":
+                    if t["be_active"]:
+                        return
+                    cur = await trading.get_price(t["pair"])
+                    if cur is None:
+                        await q.message.reply_text("❌ قیمت در دسترس نیست.")
+                        return
+                    risk = abs(t["entry"] - t["sl"])
+                    d = 1 if t["side"] == "LONG" else -1
+                    if d * (cur - t["entry"]) / risk <= 0:
+                        await q.message.reply_text("قیمت هنوز بالاتر از Entry نیست؛ بریک‌اون ممکن نیست.")
+                        return
+                    await _post(ch, trading.be_set_text(t), t["open_msg_id"])
+                    t["be_active"] = True
+                elif p[1] == "close" and t["status"] == "open":
                     cur = await trading.get_price(t["pair"])
                     if cur is None:
                         await q.message.reply_text("❌ قیمت در دسترس نیست.")
@@ -819,10 +873,19 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- settings ----------
     elif a == "set":
+        if p[1] == "rewtoggle":
+            settings()["reward_on"] = not settings()["reward_on"]
+            save()
+            await view_settings(update)
+            return
         ud["state"] = {"rewards": "set_rewards", "be": "set_be", "poll": "set_poll"}[p[1]]
         prompts = {
-            "rewards": "🏆 پله‌های ریوارد را با کاما بفرست. مثلاً <code>1,2,3</code>\n"
-                       "(وقتی قیمت به 1R، 2R، 3R در سود رسید پست می‌گذارد.)",
+            "rewards": "🏆 <b>فاصله‌ی ریوارد</b>\n\n"
+                       "فقط یک عدد بفرست؛ هر چند R یک‌بار ریوارد پست شود:\n\n"
+                       "<code>1</code> ← 1R، 2R، 3R …\n"
+                       "<code>2</code> ← 2R، 4R، 6R …\n"
+                       "<code>0.5</code> ← 0.5R، 1R، 1.5R …\n\n"
+                       "برای خاموش کردن کامل، از دکمه‌ی «خاموش کردن ریوارد» در تنظیمات استفاده کن.",
             "be": "🛡 بعد از رسیدن به کدام ریوارد SL به Entry منتقل شود؟ مثلاً <code>1</code>\n"
                   "برای غیرفعال‌سازی: <code>0</code>",
             "poll": "⏱ هر چند ثانیه قیمت چک شود؟ (2 تا 60)",
@@ -871,7 +934,7 @@ async def _process(t, cur):
     risk = abs(t["entry"] - t["sl"])
     d = 1 if t["side"] == "LONG" else -1
     r = d * (cur - t["entry"]) / risk
-    steps = [s for s in t["steps"] if s < t["rr"]]
+    steps = [s for s in t["steps"] if s < t["rr"]] if settings()["reward_on"] else []
 
     if r >= t["rr"]:
         for s in steps:
@@ -887,9 +950,11 @@ async def _process(t, cur):
             if r >= s and s not in t["rewards_hit"]:
                 await _post(ch, trading.reward_text(t, s), t["open_msg_id"])
                 t["rewards_hit"].append(s)
-                if t["be_after"] and s >= t["be_after"]:
-                    t["be_active"] = True
                 save()
+        if t["be_after"] and not t["be_active"] and r >= t["be_after"]:
+            t["be_active"] = True
+            await _post(ch, trading.be_set_text(t), t["open_msg_id"])
+            save()
         floor = 0.0 if t["be_active"] else -1.0
         if r <= floor:
             t["result_r"] = 0.0 if t["be_active"] else -1.0
