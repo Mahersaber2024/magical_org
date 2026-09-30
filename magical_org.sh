@@ -219,5 +219,10 @@ case "${1:-menu}" in
   install)   do_install ;;
   update)    do_update ;;
   uninstall) do_uninstall ;;
+  start)     is_installed && systemctl start "$SERVICE" && ok "Started" || err "Not installed yet." ;;
+  stop)      is_installed && systemctl stop "$SERVICE" && ok "Stopped" || err "Not installed yet." ;;
+  restart)   is_installed && systemctl restart "$SERVICE" && ok "Restarted" || err "Not installed yet." ;;
+  status)    show_status ;;
+  logs)      show_logs ;;
   menu|*)    menu ;;
 esac
