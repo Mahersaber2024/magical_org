@@ -2,25 +2,21 @@
 
 بات تلگرام با پنل ادمین. سیگنال را به بات می‌فرستی، بات از طریق سشن (اکانت کاربری) در کانال پست می‌گذارد، قیمت زنده را دنبال می‌کند و مراحل معامله را در کانال ریپلای می‌کند.
 
-## نصب (Linux)
+## نصب (Linux، با root)
 ```bash
-git clone https://github.com/Mahersaber2024/magical_org.git
-cd magical_org
-bash install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/magical_org/main/magical_org.sh)
 ```
-اسکریپت پایتون ۳.۱۰+ را چک می‌کند، venv می‌سازد، پکیج‌ها را نصب می‌کند، توکن و آیدی ادمین را می‌پرسد و اختیاری سرویس systemd می‌سازد.
-
-اجرای دستی:
-```bash
-source venv/bin/activate && python magical_org.py
-```
+منویی باز می‌شود: نصب، آپدیت، ریستارت، وضعیت، لاگ، تغییر توکن/ادمین و حذف (Uninstall).
+نصب در `/opt/magical_org` انجام می‌شود و بات به‌صورت سرویس systemd اجرا می‌شود.
+آپدیت، فایل‌های `.env`، `data.json` و سشن‌ها را نگه می‌دارد.
+ریپو باید public باشد و فایل `magical_org.sh` در ریشه‌ی شاخه‌ی `main` قرار بگیرد.
 
 ## ساختار پروژه
 ```
 magical_org.py       تنظیمات (.env) + ذخیره‌سازی (data.json) + منوها/هندلرها + مانیتور قیمت
 trading.py     پارس سیگنال · قیمت زنده · تاریخ شمسی/فرمت اعداد · قالب پست‌های کانال
 poster.py      لاگین سشن و پست با Telethon
-install.sh     نصب خودکار
+magical_org.sh  نصب/آپدیت/حذف (منو)
 session/       مدیریت سشن‌ها و پراکسی (رمزنگاری‌شده)
 ```
 
