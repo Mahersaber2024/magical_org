@@ -2,7 +2,7 @@
 
 🌐 **English** · [فارسی](README.fa.md)
 
-A Telegram bot with an inline admin panel for publishing trading signals. Send a signal to the bot, and it posts to your channel through a user session (account), tracks the live price, and replies in the channel at every stage of the trade.
+A Telegram bot with an inline admin panel for publishing trading signals. Send a signal to the bot, and the bot posts it to your channel, tracks the live price, and replies in the channel at every stage of the trade. No user account or session is needed: just make the bot an admin of your channel.
 
 ## Quick Install
 
@@ -36,7 +36,7 @@ The default installation path is:
 /opt/magical_org
 ```
 
-Project files, the Python virtual environment, `.env`, `data.json` and the Telegram sessions are stored in this directory.
+Project files, the Python virtual environment, `.env` and `data.json` are stored in this directory.
 
 ## Manual Installation
 
@@ -103,7 +103,7 @@ Run the installer again and select `2) Update`, or:
 bash /opt/magical_org/magical_org.sh update
 ```
 
-Updating keeps your `.env`, `data.json` and the `session/` directory.
+Updating keeps your `.env` and `data.json`.
 
 ## Uninstall
 
@@ -113,7 +113,7 @@ Run the installer and select `7) Uninstall`, or:
 bash /opt/magical_org/magical_org.sh uninstall
 ```
 
-You can choose whether to delete only the service or everything in `/opt/magical_org` (including `.env`, `data.json` and the Telegram sessions).
+You can choose whether to delete only the service or everything in `/opt/magical_org` (including `.env` and `data.json`).
 
 ## Bot Commands
 
@@ -131,8 +131,7 @@ The main menu has these buttons:
 | 📋 Active Trades | Live list with current price and R, cancel pending or close open trades |
 | 📈 Stats | Total R, win rate, best/worst trade, per-channel results |
 | 📊 Report Post | Post a performance summary of closed trades to a channel |
-| 📺 Channels | Add or remove channels |
-| 👤 Sessions | Add (with optional proxy), test or remove sessions |
+| 📺 Channels | Add, test (bot admin/post permission) or remove channels |
 | ⚙️ Settings | Reward steps, break-even rule, price check interval |
 | 🛡 Admin Panel | Manage admins, system status, backup, purge history, restart |
 | ❓ Help | Usage guide |
@@ -148,8 +147,8 @@ Destructive actions (delete, cancel, close, restart) ask for confirmation.
 ## Usage
 
 1. Send `/start`.
-2. **Sessions → Add session**: name, `api_id`, `api_hash`, phone number, optional proxy, login code, and the two-step password if enabled. Send the code with spaces (`1 2 3 4 5`) so Telegram does not invalidate it.
-3. **Channels → Add channel**: send the channel ID and pick a session that is an admin of that channel with permission to post.
+2. Add the bot to your channel as an **administrator** with permission to post messages.
+3. **Channels → Add channel**: send the channel `@username`, `-100…` ID or `t.me` link. The bot checks that it can post there.
 4. Send a signal:
 
 ```text
@@ -179,11 +178,9 @@ Prices come from the public Binance API with a Bybit fallback. No personal API k
 ```text
 magical_org.py    Config (.env), storage (data.json), menus/handlers, price monitor
 trading.py        Signal parser, live price, Jalali date and number formatting, channel post templates
-poster.py         Session login and posting with Telethon
 magical_org.sh    Install / update / uninstall menu
-session/          Session and proxy management (encrypted)
 ```
 
 ## Security
 
-Never commit the `session/` directory (`.session` files and keys), `.env` or `data.json` to GitHub. The backup button exports `data.json` only; it never includes sessions or keys.
+Never commit `.env` (it holds the bot token) or `data.json` to GitHub. The backup button exports `data.json` only.

@@ -1,5 +1,7 @@
 """magical_org — Telegram signal poster (admin panel, inline-only UI).
 
+The bot itself posts to channels (it must be an admin with post permission).
+
 Commands: /start and /help only. Everything else is driven by inline buttons.
 """
 import asyncio
@@ -15,25 +17,30 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 from telegram import BotCommand
-from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup as M, ReplyParameters, Update
 from telegram import __version__ as PTB_VERSION
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
-import poster
 import trading
 from trading import fmt_price, fmt_r, fmt_rr, fmt_step
-from session.proxy_manager import get_proxy_manager
-from session.session_manager import get_manager, session_display_name
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+# Only warnings and errors are logged (no per-request / per-job success lines).
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.WARNING)
+for _n in ("httpx", "httpcore", "apscheduler", "telegram", "telethon"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+
+
+def B(text: str, cb: str) -> InlineKeyboardButton:
+    """Inline button with explicit callback_data (2nd positional arg of PTB is `url`)."""
+    return InlineKeyboardButton(text, callback_data=cb)
+
 
 load_dotenv()
 
@@ -44,6 +51,7 @@ DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BOT_NAME = "magical_org"
 START_TS = time.time()
 LAST_TICK = 0.0
+BOT = None  # telegram.Bot, set in post_init
 
 
 # ====================== Storage (data.json) ======================
@@ -186,12 +194,12 @@ HELP = (
     f"{SIGNAL_FORMAT}\n\n"
     "• <code>Int</code> = Entry ، <code>Tp</code> = Take Profit ، <code>Sl</code> = Stop Loss\n"
     "• جهت (LONG/SHORT) و Risk/Reward خودکار محاسبه می‌شود.\n"
-    "• پیش‌نمایش می‌آید؛ کانال را انتخاب کن تا از طریق سشن همان کانال پست شود.\n\n"
+    "• پیش‌نمایش می‌آید؛ کانال را انتخاب کن تا خود بات در آن کانال پست بگذارد.\n• بات باید در کانال <b>ادمین</b> با دسترسی «ارسال پست» باشد.\n\n"
     "<b>چرخه‌ی معامله</b>\n"
     "🟡 Pending ← 🟢 Position Opened ← 🏆 Reward ها ← 🎯 TP / 🛑 SL\n"
     "همه‌ی مراحل به‌صورت ریپلای روی پست اصلی ارسال می‌شوند.\n\n"
     "<b>مدیریت</b>\n"
-    "تمام بخش‌ها (کانال‌ها، سشن‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند."
+    "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند."
 )
 
 
@@ -222,8 +230,8 @@ def home_kb():
     return M([
         [B("📋 معاملات فعال", "menu:trades"), B("📈 آمار", "menu:stats")],
         [B("📊 پست گزارش", "menu:sum"), B("📺 کانال‌ها", "menu:channels")],
-        [B("👤 سشن‌ها", "menu:sessions"), B("⚙️ تنظیمات", "menu:settings")],
-        [B("🛡 پنل ادمین", "adm:home"), B("❓ راهنما", "menu:help")],
+        [B("⚙️ تنظیمات", "menu:settings"), B("🛡 پنل ادمین", "adm:home")],
+        [B("❓ راهنما", "menu:help")],
     ])
 
 
@@ -257,18 +265,7 @@ def _counts():
 
 
 async def reset_flow(ud: dict):
-    d = ud.pop("new_ses", None)
-    if d:
-        try:
-            await poster.login_cancel(d["name"])
-        except Exception:
-            pass
-        if d.get("proxy"):
-            try:
-                get_proxy_manager().delete_proxy(d["proxy"])
-            except Exception:
-                pass
-    for k in ("state", "new_ch", "draft"):
+    for k in ("state", "draft"):
         ud.pop(k, None)
 
 
@@ -281,7 +278,7 @@ async def view_home(update):
         "━━━━━━━━━━━━━━\n"
         f"📋 معاملات فعال: <b>{pend + opn}</b>  (🟡 {pend} · 🟢 {opn})\n"
         f"📊 گزارش‌نشده: <b>{unrep}</b>\n"
-        f"📺 کانال‌ها: <b>{len(channels())}</b>   👤 سشن‌ها: <b>{len(get_manager().list_sessions())}</b>\n"
+        f"📺 کانال‌ها: <b>{len(channels())}</b>\n"
         "━━━━━━━━━━━━━━\n"
         "برای ارسال سیگنال، پیام را در این قالب بفرست:\n\n"
         f"{SIGNAL_FORMAT}"
@@ -293,30 +290,14 @@ async def view_help(update):
     await show(update, HELP, back_kb())
 
 
-async def view_sessions(update):
-    sess = get_manager().list_sessions()
-    lines = ["👤 <b>سشن‌ها</b>\n"]
-    kb = []
-    for s in sess:
-        used = [c["title"] for c in channels() if c["session"] == s["name"]]
-        lines.append(f"• <code>{esc(s['name'])}</code> — {esc(session_display_name(s))}"
-                     + (f"\n   📺 {esc(', '.join(used))}" if used else ""))
-        kb.append([B(f"🔌 تست {s['name']}", f"ses:test:{s['name']}"),
-                   B("🗑 حذف", f"ses:del:{s['name']}")])
-    if not sess:
-        lines.append("هنوز سشنی اضافه نشده است.")
-    kb.append([B("➕ افزودن سشن", "ses:add")])
-    kb.append([B("🏠 منو", "menu:home")])
-    await show(update, "\n".join(lines), M(kb))
-
-
 async def view_channels(update):
     chans = channels()
     lines = ["📺 <b>کانال‌ها</b>\n"]
     kb = []
     for c in chans:
-        lines.append(f"• {esc(c['title'])} <code>{esc(str(c['chat']))}</code> ← سشن <code>{esc(c['session'])}</code>")
-        kb.append([B(f"🗑 حذف {c['title']}", f"ch:del:{c['key']}")])
+        lines.append(f"• {esc(c['title'])} <code>{esc(str(c['chat']))}</code>")
+        kb.append([B(f"🔌 تست {c['title']}", f"ch:test:{c['key']}"),
+                   B("🗑 حذف", f"ch:del:{c['key']}")])
     if not chans:
         lines.append("هنوز کانالی اضافه نشده است.")
     kb.append([B("➕ افزودن کانال", "ch:add")])
@@ -486,7 +467,7 @@ async def view_status(update):
         "━━━━━━━━━━━━━━\n"
         f"📋 فعال: {pend + opn} (🟡 {pend} · 🟢 {opn})\n"
         f"📦 بسته‌شده: {closed} (گزارش‌نشده {unrep}) · ❌ کنسل: {cancelled}\n"
-        f"📺 کانال‌ها: {len(channels())}   👤 سشن‌ها: {len(get_manager().list_sessions())}"
+        f"📺 کانال‌ها: {len(channels())}"
     )
     await show(update, text, M([[B("🔄 بروزرسانی", "adm:status"), B("⬅️ پنل ادمین", "adm:home")]]))
 
@@ -495,6 +476,37 @@ def _reschedule(job_queue):
     for j in job_queue.get_jobs_by_name("monitor"):
         j.schedule_removal()
     job_queue.run_repeating(monitor, interval=settings()["poll_seconds"], first=3, name="monitor")
+
+
+# ====================== Channel posting (bot is the poster) ======================
+
+def _norm_chat(raw: str):
+    raw = raw.strip()
+    if re.fullmatch(r"-?\d+", raw):
+        return int(raw)
+    m = re.search(r"t\.me/([A-Za-z0-9_]+)", raw)
+    name = m.group(1) if m else raw.lstrip("@")
+    return "@" + name
+
+
+async def verify_channel(raw: str) -> dict:
+    chat = _norm_chat(raw)
+    c = await BOT.get_chat(chat)
+    m = await BOT.get_chat_member(c.id, BOT.id)
+    if m.status == "creator":
+        ok = True
+    elif m.status == "administrator":
+        ok = bool(getattr(m, "can_post_messages", False)) if c.type == "channel" else True
+    else:
+        ok = False
+    return {"chat": c.id, "title": c.title or str(c.id), "can_post": ok}
+
+
+async def _post(ch, text, reply_to=None):
+    rp = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
+    m = await BOT.send_message(chat_id=ch["chat"], text=text, parse_mode=ParseMode.HTML,
+                               reply_parameters=rp, disable_web_page_preview=True)
+    return m.message_id
 
 
 # ====================== Commands (/start, /help only) ======================
@@ -527,144 +539,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== Input flows ======================
 
-async def _try_delete(update):
-    try:
-        if update.message:
-            await update.message.delete()
-    except Exception:
-        pass
-
-
-def _parse_proxy(raw: str):
-    u = urlparse(raw.strip())
-    scheme = u.scheme.lower()
-    if scheme in ("socks5h",):
-        scheme = "socks5"
-    if scheme not in ("socks5", "socks4", "http") or not u.hostname or not u.port:
-        return None
-    return scheme, u.hostname, u.port, unquote(u.username or ""), unquote(u.password or "")
-
-
-async def _finish_session(update, context):
-    d = context.user_data.pop("new_ses")
-    context.user_data.pop("state", None)
-    me = await poster.login_finish(d["name"])
-    mgr = get_manager()
-    mgr.add_session(d["name"], d["phone"], d["api_id"], d["api_hash"], d.get("proxy", ""))
-    mgr.set_session_identity(d["name"], me.first_name or "", me.username or "")
-    await say(update, f"✅ سشن <code>{esc(d['name'])}</code> با موفقیت وصل شد ({esc(me.first_name or '')}).",
-              M([[B("👤 سشن‌ها", "menu:sessions"), B("🏠 منو", "menu:home")]]))
-
-
-async def _proxy_step(update, context, raw: str):
-    ud = context.user_data
-    d = ud["new_ses"]
-    if raw != "-":
-        p = _parse_proxy(raw)
-        if not p:
-            await say(update, "❌ فرمت پراکسی درست نیست.\nمثال: <code>socks5://user:pass@host:port</code>",
-                      _proxy_kb())
-            return
-        pname = f"px_{d['name']}"
-        pm = get_proxy_manager()
-        r = pm.add_proxy(pname, p[0], p[1], p[2], p[3], p[4])
-        if not r["success"]:
-            pm.delete_proxy(pname)
-            pm.add_proxy(pname, p[0], p[1], p[2], p[3], p[4])
-        d["proxy"] = pname
-    try:
-        await poster.login_start(d["name"], d["api_id"], d["api_hash"], d["phone"], d.get("proxy", ""))
-    except Exception as ex:
-        await reset_flow(ud)
-        await say(update, f"❌ ارسال کد ناموفق بود:\n<code>{esc(str(ex))}</code>", home_kb())
-        return
-    ud["state"] = "ses_code"
-    await say(update,
-              "🔐 <b>(۶/۶)</b> کد تلگرام را بفرست.\n"
-              "تلگرام کدی را که عیناً در چت فرستاده شود باطل می‌کند؛ پس با فاصله بفرست:\n"
-              "<code>1 2 3 4 5</code>", cancel_kb())
-
-
-def _proxy_kb():
-    return M([[B("⏭ بدون پراکسی", "ses:noproxy")], [B("✖️ انصراف", "menu:home")]])
-
-
 async def handle_state(update, context, st, text):
     ud = context.user_data
-    if st == "ses_name":
-        mgr = get_manager()
-        if not re.fullmatch(r"[A-Za-z0-9_]{2,24}", text):
-            await say(update, "❌ فقط حروف انگلیسی، عدد و _ (۲ تا ۲۴ کاراکتر).", cancel_kb())
-            return
-        if text in mgr.sessions or (mgr.session_dir / f"{text}.session").exists():
-            await say(update, "❌ این نام قبلاً استفاده شده است.", cancel_kb())
-            return
-        ud["new_ses"] = {"name": text}
-        ud["state"] = "ses_api_id"
-        await say(update, "🔑 <b>(۲/۶)</b> <code>api_id</code> اکانت را بفرست (از my.telegram.org):", cancel_kb())
-    elif st == "ses_api_id":
-        if not text.isdigit():
-            await say(update, "❌ api_id فقط عدد است.", cancel_kb())
-            return
-        ud["new_ses"]["api_id"] = int(text)
-        ud["state"] = "ses_api_hash"
-        await say(update, "🔑 <b>(۳/۶)</b> <code>api_hash</code> را بفرست (پیام بعد از دریافت پاک می‌شود):", cancel_kb())
-    elif st == "ses_api_hash":
-        await _try_delete(update)
-        if not re.fullmatch(r"[0-9a-fA-F]{32}", text):
-            await say(update, "❌ api_hash باید ۳۲ کاراکتر هگز باشد.", cancel_kb())
-            return
-        ud["new_ses"]["api_hash"] = text
-        ud["state"] = "ses_phone"
-        await say(update, "📱 <b>(۴/۶)</b> شماره‌ی اکانت با کد کشور:\n<code>+491234567890</code>", cancel_kb())
-    elif st == "ses_phone":
-        phone = "+" + re.sub(r"\D", "", text)
-        if len(phone) < 8:
-            await say(update, "❌ شماره نامعتبر است.", cancel_kb())
-            return
-        if get_manager().is_phone_registered(phone):
-            await say(update, "❌ این شماره قبلاً ثبت شده است.", cancel_kb())
-            return
-        ud["new_ses"]["phone"] = phone
-        ud["state"] = "ses_proxy"
-        await say(update, "🌐 <b>(۵/۶)</b> پراکسی (اختیاری):\n"
-                          "<code>socks5://user:pass@host:port</code>\n"
-                          "یا دکمه‌ی «بدون پراکسی» را بزن.", _proxy_kb())
-    elif st == "ses_proxy":
-        await _proxy_step(update, context, text)
-    elif st == "ses_code":
-        await _try_delete(update)
-        code = re.sub(r"\D", "", text)
+    if st == "ch_chat":
         try:
-            res = await poster.login_code(ud["new_ses"]["name"], code)
+            info = await verify_channel(text)
         except Exception as ex:
-            await say(update, f"❌ کد رد شد: <code>{esc(str(ex))}</code>\nدوباره بفرست یا انصراف بزن.", cancel_kb())
+            await say(update, f"❌ کانال پیدا نشد: <code>{esc(str(ex))}</code>\n"
+                              "بات را به کانال اضافه کن و ادمین کن، بعد دوباره آیدی را بفرست.", cancel_kb())
             return
-        if res == "password":
-            ud["state"] = "ses_pw"
-            await say(update, "🔒 رمز تأیید دو مرحله‌ای را بفرست (پیام پاک می‌شود):", cancel_kb())
-        else:
-            await _finish_session(update, context)
-    elif st == "ses_pw":
-        await _try_delete(update)
-        try:
-            await poster.login_password(ud["new_ses"]["name"], text)
-        except Exception as ex:
-            await say(update, f"❌ رمز رد شد: <code>{esc(str(ex))}</code>\nدوباره بفرست یا انصراف بزن.", cancel_kb())
+        if not info["can_post"]:
+            await say(update, "❌ بات در این کانال ادمین با دسترسی «ارسال پست» نیست.\n"
+                              "دسترسی را بده و دوباره آیدی را بفرست.", cancel_kb())
             return
-        await _finish_session(update, context)
-    elif st == "ch_chat":
-        sess = get_manager().list_sessions()
-        if not sess:
-            ud.pop("state", None)
-            await say(update, "❌ اول یک سشن اضافه کن.", M([[B("👤 سشن‌ها", "menu:sessions")]]))
+        if any(str(c["chat"]) == str(info["chat"]) for c in channels()):
+            await say(update, "ℹ️ این کانال قبلاً اضافه شده است.", cancel_kb())
             return
-        ud["new_ch"] = {"raw": text}
-        ud["state"] = None
-        kb = [[B(session_display_name(s), f"chs:{s['name']}")] for s in sess]
-        kb.append([B("✖️ انصراف", "menu:home")])
-        await say(update, "کدام سشن در این کانال پست بگذارد؟\n"
-                          "(باید ادمینِ کانال با دسترسی «ارسال پست» باشد)", M(kb))
+        ud.pop("state", None)
+        add_channel(info["chat"], info["title"], "bot")
+        await say(update, f"✅ کانال «{esc(info['title'])}» اضافه شد.",
+                  M([[B("📺 کانال‌ها", "menu:channels"), B("🏠 منو", "menu:home")]]))
     elif st == "adm_add":
         if not re.fullmatch(r"\d{5,15}", text):
             await say(update, "❌ آیدی عددی تلگرام را بفرست (مثلاً <code>123456789</code>).", cancel_kb())
@@ -746,10 +640,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_signal(update, context, text)
 
 
-async def _post(ch, text, reply_to=None):
-    return await poster.send(ch["session"], ch["chat"], text, reply_to)
-
-
 # ====================== Callbacks ======================
 
 @admin_only
@@ -770,7 +660,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if a == "menu":
         await reset_flow(ud)
-        views = {"home": view_home, "sessions": view_sessions, "channels": view_channels,
+        views = {"home": view_home, "channels": view_channels,
                  "trades": view_trades, "settings": view_settings, "sum": view_sum,
                  "stats": view_stats, "help": view_help}
         await views.get(p[1], view_home)(update)
@@ -829,46 +719,26 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show(update, "🔄 در حال ریستارت… چند ثانیه‌ی دیگر /start را بزن.")
             asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
 
-    # ---------- sessions ----------
-    elif a == "ses":
-        if p[1] == "add":
-            ud["state"] = "ses_name"
-            await show(update, "➕ <b>افزودن سشن</b>\n\n📝 <b>(۱/۶)</b> یک نام انگلیسی برای سشن بفرست (مثلاً <code>acc1</code>):",
-                       cancel_kb())
-        elif p[1] == "noproxy":
-            if ud.get("state") == "ses_proxy" and ud.get("new_ses"):
-                await _proxy_step(update, context, "-")
-        elif p[1] == "test":
-            try:
-                me = await poster.whoami(p[2])
-                await q.message.reply_text(f"✅ وصل است: {esc(me.first_name or '')} @{esc(me.username or '-')}",
-                                           parse_mode=ParseMode.HTML)
-            except Exception as ex:
-                await q.message.reply_text(f"❌ {esc(str(ex))}", parse_mode=ParseMode.HTML)
-        elif p[1] == "del":
-            if any(c["session"] == p[2] for c in channels()):
-                await q.message.reply_text("⚠️ این سشن به یک کانال وصل است؛ اول کانال را حذف کن.")
-                return
-            await show(update, f"🗑 سشن <code>{esc(p[2])}</code> حذف شود؟ (فایل سشن پاک می‌شود)",
-                       confirm_kb(f"ses:delok:{p[2]}", "menu:sessions"))
-        elif p[1] == "delok":
-            name = p[2]
-            if any(c["session"] == name for c in channels()):
-                await view_sessions(update)
-                return
-            await poster.drop_client(name)
-            get_manager().delete_session(name)
-            pm = get_proxy_manager()
-            if pm.get_proxy(f"px_{name}"):
-                pm.delete_proxy(f"px_{name}")
-            await view_sessions(update)
-
     # ---------- channels ----------
     elif a == "ch":
         if p[1] == "add":
             ud["state"] = "ch_chat"
-            await show(update, "➕ <b>افزودن کانال</b>\n\nآیدی کانال را بفرست:\n"
+            await show(update, "➕ <b>افزودن کانال</b>\n\n"
+                               f"۱) بات (@{esc(BOT.username or '')}) را به کانال اضافه کن و <b>ادمین</b> کن (دسترسی «ارسال پست»).\n"
+                               "۲) آیدی کانال را بفرست:\n"
                                "<code>@username</code> یا <code>-100…</code> یا لینک t.me", cancel_kb())
+        elif p[1] == "test":
+            ch = get_channel(p[2])
+            if not ch:
+                await view_channels(update)
+                return
+            try:
+                info = await verify_channel(str(ch["chat"]))
+                msg = ("✅ بات در این کانال ادمین است و می‌تواند پست بگذارد."
+                       if info["can_post"] else "❌ بات دسترسی «ارسال پست» ندارد.")
+            except Exception as ex:
+                msg = f"❌ <code>{esc(str(ex))}</code>"
+            await q.message.reply_text(f"🔌 {esc(ch['title'])}\n{msg}", parse_mode=ParseMode.HTML)
         elif p[1] == "del":
             ch = get_channel(p[2])
             if not ch:
@@ -883,23 +753,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not active_trades(p[2]):
                 delete_channel(p[2])
             await view_channels(update)
-
-    elif a == "chs":
-        raw = ud.get("new_ch", {}).get("raw")
-        if not raw:
-            return
-        try:
-            info = await poster.verify_channel(p[1], raw)
-        except Exception as ex:
-            await show(update, f"❌ کانال پیدا نشد: <code>{esc(str(ex))}</code>\n"
-                               "سشن باید عضو/ادمین کانال باشد.", back_kb())
-            return
-        if not info["can_post"]:
-            await show(update, "❌ این سشن در کانال ادمین با دسترسی «ارسال پست» نیست.", back_kb())
-            return
-        ud.pop("new_ch", None)
-        add_channel(info["chat"], info["title"], p[1])
-        await view_channels(update)
 
     # ---------- signals ----------
     elif a == "sig":
@@ -1076,6 +929,8 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
+    global BOT
+    BOT = app.bot
     try:
         me = await app.bot.get_me()
         if me.first_name != BOT_NAME:

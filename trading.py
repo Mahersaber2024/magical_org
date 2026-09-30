@@ -78,15 +78,37 @@ def fmt_step(s: float) -> str:
 
 # ====================== Signal parser ======================
 
-_ENTRY = re.compile(r"^(?:int|entry|ent|en)\s*[:=]?\s*([\d.,]+)$", re.I)
-_TP = re.compile(r"^(?:tp|take\s*profit)\s*[:=]?\s*([\d.,]+)$", re.I)
-_SL = re.compile(r"^(?:sl|stop(?:\s*loss)?)\s*[:=]?\s*([\d.,]+)$", re.I)
+_NUM = r"([\d][\d.,'’_ ]*)"
+_ENTRY = re.compile(r"^(?:int|entry|ent|en)\s*[:=]?\s*" + _NUM + "$", re.I)
+_TP = re.compile(r"^(?:tp|take\s*profit)\s*[:=]?\s*" + _NUM + "$", re.I)
+_SL = re.compile(r"^(?:sl|stop(?:\s*loss)?)\s*[:=]?\s*" + _NUM + "$", re.I)
+
+# Persian / Arabic-Indic digits and separators -> ASCII
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫٬", "01234567890123456789.,")
+_JUNK = str.maketrans("", "", "`*$_~|\u200c\u200f\u200e\u00a0")
 
 QUOTES = ("USDT", "USDC", "BUSD", "FDUSD")
 
 
 def _num(s: str) -> float:
-    return float(s.replace(",", ""))
+    """Parse prices written as 83865.2 / 83,865.20 / 83.865,20 / 83 865.20 / 0,5."""
+    s = re.sub(r"[\s'’_]", "", s).strip(".,")
+    has_c, has_d = "," in s, "." in s
+    if has_c and has_d:
+        # the separator that appears last is the decimal point
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif has_c:
+        # 83,865 / 1,234,567 -> thousands ; 0,5 / 83,5 -> decimal comma
+        if re.fullmatch(r"\d{1,3}(,\d{3})+", s):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+    elif has_d and s.count(".") > 1:
+        s = s.replace(".", "")  # 1.234.567
+    return float(s)
 
 
 def normalize_pair(raw: str):
@@ -101,6 +123,7 @@ def normalize_pair(raw: str):
 
 
 def parse_signal(text: str):
+    text = text.translate(_DIGITS).translate(_JUNK)
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     symbol = entry = tp = sl = None
     for line in lines:

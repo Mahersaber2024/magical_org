@@ -73,8 +73,6 @@ setup_venv() {
   [ -d "$DIR/venv" ] || python3 -m venv "$DIR/venv" || { err "python3-venv is missing."; exit 1; }
   "$DIR/venv/bin/pip" install --upgrade pip >/dev/null
   "$DIR/venv/bin/pip" install -r "$DIR/requirements.txt" || { err "pip install failed."; exit 1; }
-  mkdir -p "$DIR/session"
-  chmod 700 "$DIR/session"
 }
 
 configure_env() {
@@ -143,7 +141,7 @@ do_update() {
   download_code
   setup_venv
   systemctl restart "$SERVICE"
-  ok "Updated. Your .env, data.json and sessions were kept."
+  ok "Updated. Your .env and data.json were kept."
 }
 
 do_reconfigure() {
@@ -161,13 +159,13 @@ do_uninstall() {
   rm -f "$UNIT"
   systemctl daemon-reload
   ok "Service removed"
-  ask "Also delete ALL files in $DIR (code, .env, data.json, Telegram sessions)? [y/N]: " wipe
+  ask "Also delete ALL files in $DIR (code, .env, data.json)? [y/N]: " wipe
   if [[ "$wipe" =~ ^[Yy]$ ]]; then
     rm -rf "$DIR"
     ok "Everything deleted"
   else
     rm -rf "$DIR/venv"
-    info "Kept $DIR (config, data and sessions). Delete it manually if you no longer need it."
+    info "Kept $DIR (config and data). Delete it manually if you no longer need it."
   fi
 }
 
