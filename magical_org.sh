@@ -62,8 +62,7 @@ download_code() {
   mkdir -p "$DIR"
   tar -xzf "$tmp/src.tar.gz" --strip-components=1 -C "$DIR" \
     --exclude='*/.env' --exclude='*/data.json' \
-    --exclude='*/session/*.session' --exclude='*/session/*.session-journal' \
-    --exclude='*/session/*.encrypted' --exclude='*/session/.*key'
+    --exclude='*/data.db' --exclude='*/data.db-wal' --exclude='*/data.db-shm'
   rm -rf "$tmp"
   ok "Code is in $DIR"
 }
@@ -94,7 +93,7 @@ configure_env() {
 BOT_TOKEN=${token}
 ADMIN_IDS=${admins}
 TIMEZONE=${tz}
-DATA_FILE=data.json
+DB_FILE=data.db
 ENV
   chmod 600 "$DIR/.env"
   ok ".env saved"
@@ -141,7 +140,7 @@ do_update() {
   download_code
   setup_venv
   systemctl restart "$SERVICE"
-  ok "Updated. Your .env and data.json were kept."
+  ok "Updated. Your .env and data.db were kept."
 }
 
 do_reconfigure() {
@@ -159,7 +158,7 @@ do_uninstall() {
   rm -f "$UNIT"
   systemctl daemon-reload
   ok "Service removed"
-  ask "Also delete ALL files in $DIR (code, .env, data.json)? [y/N]: " wipe
+  ask "Also delete ALL files in $DIR (code, .env, data.db)? [y/N]: " wipe
   if [[ "$wipe" =~ ^[Yy]$ ]]; then
     rm -rf "$DIR"
     ok "Everything deleted"

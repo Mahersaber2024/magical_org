@@ -1,7 +1,5 @@
 # magical_org – Telegram Signal Poster
 
-🌐 **English** · [فارسی](README.fa.md)
-
 A Telegram bot with an inline admin panel for publishing trading signals. Send a signal to the bot, and the bot posts it to your channel, tracks the live price, and replies in the channel at every stage of the trade. No user account or session is needed: just make the bot an admin of your channel.
 
 ## Quick Install
@@ -36,7 +34,7 @@ The default installation path is:
 /opt/magical_org
 ```
 
-Project files, the Python virtual environment, `.env` and `data.json` are stored in this directory.
+Project files, the Python virtual environment, `.env` and the SQLite database `data.db` are stored in this directory.
 
 ## Manual Installation
 
@@ -55,7 +53,7 @@ cat > .env <<'ENV'
 BOT_TOKEN=123456:ABC-your-bot-token
 ADMIN_IDS=12345,67890
 TIMEZONE=Asia/Tehran
-DATA_FILE=data.json
+DB_FILE=data.db
 ENV
 
 python3 magical_org.py
@@ -70,7 +68,8 @@ python3 magical_org.py
 | `BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) | – |
 | `ADMIN_IDS` | Owner Telegram user IDs, comma separated | – |
 | `TIMEZONE` | Timezone for the Jalali date shown in posts | `Asia/Tehran` |
-| `DATA_FILE` | Path of the JSON data file | `data.json` |
+| `DB_FILE` | Path of the SQLite database | `data.db` |
+| `DATA_FILE` | Old JSON file, imported into the database once if it exists | `data.json` |
 
 ## Service Management
 
@@ -103,7 +102,7 @@ Run the installer again and select `2) Update`, or:
 bash /opt/magical_org/magical_org.sh update
 ```
 
-Updating keeps your `.env` and `data.json`.
+Updating keeps your `.env` and `data.db`.
 
 ## Uninstall
 
@@ -113,11 +112,12 @@ Run the installer and select `7) Uninstall`, or:
 bash /opt/magical_org/magical_org.sh uninstall
 ```
 
-You can choose whether to delete only the service or everything in `/opt/magical_org` (including `.env` and `data.json`).
+You can choose whether to delete only the service or everything in `/opt/magical_org` (including `.env` and `data.db`).
 
 ## Bot Commands
 
-- `/start` – Open the admin panel.
+- `/menu` – Same as `/start`.
+- `/start` – Open the admin panel. A «منو» button appears on Telegram's keyboard; tap it any time to open the main menu.
 - `/help` – Show help.
 
 All other operations are available through the inline menu.
@@ -132,7 +132,7 @@ The main menu has these buttons:
 | 📈 Stats | Total R, win rate, best/worst trade, per-channel results |
 | 📊 Report Post | Post a performance summary of closed trades to a channel |
 | 📺 Channels | Add, test (bot admin/post permission) or remove channels |
-| ⚙️ Settings | Reward steps, break-even rule, price check interval |
+| ⚙️ Settings | Reward steps, break-even rule, price check interval, auto report |
 | 🛡 Admin Panel | Manage admins, system status, backup, purge history, restart |
 | ❓ Help | Usage guide |
 
@@ -169,6 +169,18 @@ Sl80000
 - Price reaches TP or SL → result post with the final R.
 - **Report Post** → summary with each trade result, total R, win rate and collected rewards.
 
+## Database
+
+Channels, open positions, trade history, admins and settings are stored in a SQLite database (`data.db`). Nothing is lost when the bot restarts, crashes or is updated. If an old `data.json` exists, it is imported automatically on the first start and renamed to `data.json.migrated`.
+
+## Auto Report
+
+**Settings → 📅 Auto Report** posts a daily report to every channel at a time you choose (in `TIMEZONE`):
+
+- **Time**: pick a preset or send any `HH:MM`.
+- **Condition**: *Always* (whenever trades were closed that day) or *Profitable days only* (skipped when the day's total R is not positive).
+- If the bot was offline at the scheduled time, the report is sent shortly after it starts.
+
 ## Live Price
 
 Prices come from the public Binance API with a Bybit fallback. No personal API key is needed. Touch detection is as accurate as the check interval (default 5 seconds); a very short wick between two checks may not be seen.
@@ -176,11 +188,11 @@ Prices come from the public Binance API with a Bybit fallback. No personal API k
 ## Project Structure
 
 ```text
-magical_org.py    Config (.env), storage (data.json), menus/handlers, price monitor
+magical_org.py    Config (.env), storage (SQLite data.db), menus/handlers, price monitor, auto report
 trading.py        Signal parser, live price, Jalali date and number formatting, channel post templates
 magical_org.sh    Install / update / uninstall menu
 ```
 
 ## Security
 
-Never commit `.env` (it holds the bot token) or `data.json` to GitHub. The backup button exports `data.json` only.
+Never commit `.env` (it holds the bot token) or `data.db` to GitHub. The backup button exports a consistent copy of `data.db` only.

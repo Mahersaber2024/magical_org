@@ -273,13 +273,29 @@ def final_text(t):
     return {"tp": tp_text, "sl": sl_text, "be": be_text, "manual": manual_text}[t["outcome"]](t)
 
 
-def summary_text(trades):
-    lines = ["<b>Performance Report</b>", LINE]
+HEAVY = "━━━━━━━━━━━━━━"
+
+
+def _bar(pct: float, n: int = 10) -> str:
+    k = max(0, min(n, round(pct / 100 * n)))
+    return "▰" * k + "▱" * (n - k)
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def summary_text(trades, title: str = "Performance Report", limit: int = 40):
+    rows = sorted(trades, key=lambda x: x["id"])
+    n = len(rows)
     total = 0.0
     wins = losses = be = 0
     counts = {}
-    for t in sorted(trades, key=lambda x: x["id"]):
+    rs = []
+    lines = []
+    for t in rows:
         r = t["result_r"] or 0.0
+        rs.append(r)
         total += r
         if r > 0.005:
             wins += 1
@@ -292,16 +308,29 @@ def summary_text(trades):
             mark = "⚪️"
         for st in t["rewards_hit"]:
             counts[st] = counts.get(st, 0) + 1
-        hit = " · ".join(fmt_step(st) for st in sorted(t["rewards_hit"]))
-        extra = f"   ({hit})" if hit else ""
-        lines.append(f"{mark} {e(t['symbol'])} {t['side']}   <b>{fmt_r(r)}</b>{extra}")
-    n = len(trades)
-    lines += [LINE,
-              f"Total   <b>{fmt_r(total)}</b>",
-              f"Wins {wins}  ·  Losses {losses}  ·  BE {be}",
-              f"Win rate   {round(wins / n * 100)}%"]
+        if len(lines) < limit:
+            hit = " · ".join(fmt_step(st) for st in sorted(t["rewards_hit"]))
+            extra = f"   🏆 {hit}" if hit else ""
+            no = t.get("no", t["id"])
+            lines.append(f"{mark} <code>#{no}</code> {e(t['symbol'])} {t['side']}  ·  <b>{fmt_r(r)}</b>{extra}")
+    if n > limit:
+        lines.append(f"… +{n - limit} more")
+
+    head = "🔥" if total > 0.005 else ("📉" if total < -0.005 else "⚖️")
+    wr = wins / n * 100
+    out = [
+        f"📊 <b>{e(title.upper())}</b>",
+        f"<i>{fa_date()}</i>",
+        HEAVY,
+        "<blockquote>" + "\n".join(lines) + "</blockquote>",
+        HEAVY,
+        f"{head} Net Result   <b>{fmt_r(total)}</b>",
+        f"🎯 Win Rate   {_bar(wr)}  <b>{round(wr)}%</b>",
+        f"✅ {_plural(wins, 'Win', 'Wins')}  ·  ❌ {_plural(losses, 'Loss', 'Losses')}  ·  ➖ {be} BE",
+        f"📈 Avg {fmt_r(total / n)}  ·  🥇 Best {fmt_r(max(rs))}  ·  🥀 Worst {fmt_r(min(rs))}",
+    ]
     if counts:
         rw = " · ".join(f"{fmt_step(st)}×{c}" for st, c in sorted(counts.items()))
-        lines.append(f"Rewards   {rw}")
-    lines += [LINE, fa_date()]
-    return "\n".join(lines)
+        out.append(f"🎁 Rewards   {rw}")
+    out.append(HEAVY)
+    return "\n".join(out)

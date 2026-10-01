@@ -2,7 +2,7 @@
 
 The bot itself posts to channels (it must be an admin with post permission).
 
-Commands: /start and /help only. Everything else is driven by inline buttons.
+Commands: /menu, /start and /help only. Everything else is driven by inline buttons.
 """
 import asyncio
 import copy
@@ -12,16 +12,23 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import BotCommand
+from telegram import BotCommand, MenuButtonCommands, ReplyKeyboardMarkup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup as M, ReplyParameters, Update
 from telegram import __version__ as PTB_VERSION
+try:
+    from telegram import CopyTextButton  # python-telegram-bot >= 21.7
+except ImportError:  # older library: the copy button is simply left out
+    CopyTextButton = None
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
@@ -45,51 +52,179 @@ def B(text: str, cb: str) -> InlineKeyboardButton:
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# Owners come from .env. Extra admins (managed from the bot) live in data.json.
+# Owners come from .env. Extra admins (managed from the bot) live in the SQLite database.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
+DATA_FILE = os.getenv("DATA_FILE", "data.json")   # legacy JSON store, imported once
+DB_FILE = os.getenv("DB_FILE", "data.db")         # SQLite database (channels, trades, settings)
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _path(p: str) -> Path:
+    pp = Path(p)
+    return pp if pp.is_absolute() else BASE_DIR / pp
+
+
+DB_PATH = _path(DB_FILE)
+LEGACY_PATH = _path(DATA_FILE)
+TZ = ZoneInfo(trading.TIMEZONE)
 BOT_NAME = "magical_org"
 START_TS = time.time()
 LAST_TICK = 0.0
 BOT = None  # telegram.Bot, set in post_init
 
 
-# ====================== Storage (data.json) ======================
+# ====================== Storage (SQLite) ======================
+# The whole state is kept in memory as a dict (fast reads) and every save() writes only
+# the rows that changed to SQLite, so channels, positions and trade history survive restarts.
 
 DEFAULTS = {
     "channels": [],
     "trades": [],
     "admins": [],
     "trade_counter": 0,
-    "settings": {"reward_on": True, "reward_every": 1, "be_after": 0, "poll_seconds": 5},
+    "settings": {"reward_on": True, "reward_every": 1, "be_after": 0, "poll_seconds": 5,
+                 "auto_on": False, "auto_time": "21:00", "auto_mode": "always",
+                 "auto_last_ts": "", "auto_last_date": ""},
 }
 
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS channels (key TEXT PRIMARY KEY, pos INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY, channel TEXT, status TEXT, closed_at TEXT, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_channel ON trades(channel);
+"""
+
 _data = None
+_conn = None
+_snap = {"counter": None, "settings": None, "admins": set(), "channels": {}, "trades": {}}
+
+
+def get_conn() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.executescript(_SCHEMA)
+        _conn.commit()
+    return _conn
+
+
+def _dump(o) -> str:
+    return json.dumps(o, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _kv_get(key: str, default: str) -> str:
+    r = get_conn().execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+
+def _normalize(d: dict):
+    st = d.get("settings") or {}
+    if "reward_every" not in st and st.get("reward_steps"):  # migrate old list -> interval
+        st["reward_every"] = float(min(st["reward_steps"]))
+    for k, v in DEFAULTS.items():
+        d.setdefault(k, copy.deepcopy(v))
+    for k, v in DEFAULTS["settings"].items():
+        d["settings"].setdefault(k, v)
+
+
+def _load() -> dict:
+    global _data
+    c = get_conn()
+    initialized = c.execute("SELECT 1 FROM kv WHERE key='initialized'").fetchone()
+    migrated = False
+    if initialized:
+        ch_rows = [r[0] for r in c.execute("SELECT data FROM channels ORDER BY pos")]
+        tr_rows = c.execute("SELECT id, data FROM trades ORDER BY id").fetchall()
+        data = {
+            "trade_counter": int(_kv_get("trade_counter", "0")),
+            "settings": json.loads(_kv_get("settings", "{}")),
+            "admins": [r[0] for r in c.execute("SELECT user_id FROM admins ORDER BY rowid")],
+            "channels": [json.loads(x) for x in ch_rows],
+            "trades": [json.loads(r[1]) for r in tr_rows],
+        }
+        # snapshot = what is on disk right now, so save() only writes real changes
+        _snap["counter"] = str(data["trade_counter"])
+        _snap["settings"] = _kv_get("settings", "{}")
+        _snap["admins"] = set(data["admins"])
+        _snap["channels"] = {json.loads(x)["key"]: (i, x) for i, x in enumerate(ch_rows)}
+        _snap["trades"] = {r[0]: r[1] for r in tr_rows}
+    else:
+        data = {}
+        if LEGACY_PATH.exists():  # one-time import of the old data.json
+            with open(LEGACY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            migrated = True
+    _normalize(data)
+    _data = data
+    if not initialized:
+        save()
+        c.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('initialized', '1')")
+        c.commit()
+        if migrated:
+            os.replace(LEGACY_PATH, str(LEGACY_PATH) + ".migrated")
+            log.warning("data.json imported into %s", DB_PATH)
+    return data
 
 
 def db() -> dict:
-    global _data
     if _data is None:
-        loaded = {}
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-        _data = loaded
-        st = _data.get("settings", {})
-        if "reward_every" not in st and st.get("reward_steps"):  # migrate old list -> interval
-            st["reward_every"] = float(min(st["reward_steps"]))
-        for k, v in DEFAULTS.items():
-            _data.setdefault(k, copy.deepcopy(v))
-        for k, v in DEFAULTS["settings"].items():
-            _data["settings"].setdefault(k, v)
+        _load()
     return _data
 
 
 def save():
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db(), f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
+    d = db()
+    c = get_conn()
+    cnt = str(d["trade_counter"])
+    st = _dump(d["settings"])
+    adm = set(d["admins"])
+    ch_now = {ch["key"]: (i, _dump(ch)) for i, ch in enumerate(d["channels"])}
+    tr_now = {t["id"]: _dump(t) for t in d["trades"]}
+    with c:  # one transaction
+        if cnt != _snap["counter"]:
+            c.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('trade_counter', ?)", (cnt,))
+        if st != _snap["settings"]:
+            c.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('settings', ?)", (st,))
+        for uid in adm - _snap["admins"]:
+            c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (uid,))
+        for uid in _snap["admins"] - adm:
+            c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        for k, v in ch_now.items():
+            if _snap["channels"].get(k) != v:
+                c.execute("INSERT INTO channels(key, pos, data) VALUES(?,?,?) "
+                          "ON CONFLICT(key) DO UPDATE SET pos=excluded.pos, data=excluded.data",
+                          (k, v[0], v[1]))
+        for k in set(_snap["channels"]) - set(ch_now):
+            c.execute("DELETE FROM channels WHERE key=?", (k,))
+        for t in d["trades"]:
+            js = tr_now[t["id"]]
+            if _snap["trades"].get(t["id"]) != js:
+                c.execute("INSERT INTO trades(id, channel, status, closed_at, data) VALUES(?,?,?,?,?) "
+                          "ON CONFLICT(id) DO UPDATE SET channel=excluded.channel, status=excluded.status, "
+                          "closed_at=excluded.closed_at, data=excluded.data",
+                          (t["id"], t.get("channel"), t.get("status"), t.get("closed_at"), js))
+        for tid in set(_snap["trades"]) - set(tr_now):
+            c.execute("DELETE FROM trades WHERE id=?", (tid,))
+    _snap.update(counter=cnt, settings=st, admins=adm, channels=ch_now, trades=tr_now)
+
+
+def make_backup() -> Path:
+    """Consistent copy of the live database in a temp file (caller deletes it)."""
+    save()
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    dst = sqlite3.connect(tmp)
+    try:
+        get_conn().backup(dst)
+    finally:
+        dst.close()
+    return Path(tmp)
 
 
 def settings() -> dict:
@@ -104,9 +239,8 @@ def get_channel(key: str):
     return next((c for c in channels() if c["key"] == key), None)
 
 
-def add_channel(chat, title: str, session: str) -> dict:
-    ch = {"key": uuid.uuid4().hex[:6], "chat": chat, "title": title,
-          "session": session, "counter": 0}
+def add_channel(chat, title: str) -> dict:
+    ch = {"key": uuid.uuid4().hex[:6], "chat": chat, "title": title, "counter": 0}
     channels().append(ch)
     save()
     return ch
@@ -203,8 +337,9 @@ def admin_only(fn):
 LOCK = asyncio.Lock()
 esc = html.escape
 
-# <pre> block: one tap copies the whole template in Telegram.
+# <pre> block (monospace, one block). The home screen also has a copy button for all lines.
 SIGNAL_FORMAT = "<pre>BTC\nInt\nTp\nSl</pre>"
+SIGNAL_TEXT = "BTC\nInt\nTp\nSl"  # exactly what the copy button puts on the clipboard
 SIGNAL_EXAMPLE = "<pre>btc\nInt81000\nTp87000\nSl80000</pre>"
 
 HELP = (
@@ -221,7 +356,8 @@ HELP = (
     "Pending ← Position Opened ← Reward ها ← TP / SL\n"
     "همه‌ی مراحل به‌صورت ریپلای روی پست اصلی ارسال می‌شوند.\n\n"
     "<b>مدیریت</b>\n"
-    "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند."
+    "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند.\n"
+    "گزارش روزانه‌ی خودکار از «تنظیمات ← گزارش خودکار» قابل تنظیم است."
 )
 
 
@@ -248,17 +384,29 @@ async def say(update: Update, text: str, kb=None):
         text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
 
+MENU_LABEL = "🏠 منو"
+PEND_LABEL = "◷ پندینگ"
+POS_LABEL = "● پوزیشن"
+
+
+def main_kb() -> ReplyKeyboardMarkup:
+    """Telegram's own persistent keyboard: Pending + Positions on top, Menu below."""
+    return ReplyKeyboardMarkup([[PEND_LABEL, POS_LABEL], [MENU_LABEL]],
+                               resize_keyboard=True, is_persistent=True)
+
+
 def home_kb():
-    return M([
-        [B("📋 معاملات فعال", "menu:trades"), B("📈 آمار", "menu:stats")],
-        [B("📊 پست گزارش", "menu:sum"), B("📺 کانال‌ها", "menu:channels")],
-        [B("⚙️ تنظیمات", "menu:settings"), B("🛡 پنل ادمین", "adm:home")],
-        [B("❓ راهنما", "menu:help")],
+    copy_row = ([[InlineKeyboardButton("📋 کپی قالب سیگنال", copy_text=CopyTextButton(text=SIGNAL_TEXT))]]
+                if CopyTextButton else [])
+    return M(copy_row + [
+        [B("📈 عملکرد", "menu:stats"), B("📊 پست گزارش", "menu:sum")],
+        [B("📺 کانال‌ها", "menu:channels"), B("⚙️ تنظیمات", "menu:settings")],
+        [B("🛡 پنل ادمین", "adm:home"), B("❓ راهنما", "menu:help")],
     ])
 
 
 def back_kb():
-    return M([[B("🏠 منو", "menu:home")]])
+    return M([[B("⬅️ بازگشت", "menu:home")]])
 
 
 def cancel_kb():
@@ -302,7 +450,7 @@ async def view_home(update):
         f"📊 گزارش‌نشده: <b>{unrep}</b>\n"
         f"📺 کانال‌ها: <b>{len(channels())}</b>"
         "</blockquote>\n\n"
-        "📝 <b>قالب سیگنال</b> (با یک لمس کپی می‌شود)\n"
+        "📝 <b>قالب سیگنال</b> (با دکمه‌ی «کپی قالب» هر چهار خط یکجا کپی می‌شود)\n"
         f"{SIGNAL_FORMAT}"
     )
     await show(update, text, home_kb())
@@ -323,15 +471,24 @@ async def view_channels(update):
     if not chans:
         lines.append("هنوز کانالی اضافه نشده است.")
     kb.append([B("➕ افزودن کانال", "ch:add")])
-    kb.append([B("🏠 منو", "menu:home")])
+    kb.append([B("⬅️ بازگشت", "menu:home")])
     await show(update, "\n".join(lines), M(kb))
 
 
-async def view_trades(update, page: int = 0):
-    active = active_trades()
+TRADE_VIEWS = {
+    "p": ("◷ پندینگ‌ها", "پندینگی وجود ندارد.", ("pending",)),
+    "o": ("● پوزیشن‌های فعال", "پوزیشن بازی وجود ندارد.", ("open",)),
+    "a": ("معاملات فعال", "معامله‌ی فعالی وجود ندارد.", ("pending", "open")),
+}
+
+
+async def view_trades(update, page: int = 0, kind: str = "a"):
+    kind = kind if kind in TRADE_VIEWS else "a"
+    title, empty_msg, statuses = TRADE_VIEWS[kind]
+    active = [t for t in active_trades() if t["status"] in statuses]
     if not active:
-        await show(update, "<b>معاملات فعال</b>\n\nمعامله‌ی فعالی وجود ندارد.",
-                   M([[B("بروزرسانی", "trp:0"), B("منو", "menu:home")]]))
+        await show(update, f"<b>{title}</b>\n\n{empty_msg}",
+                   M([[B("بروزرسانی", f"trp:0:{kind}")]]))
         return
     per = 5
     pages = (len(active) + per - 1) // per
@@ -342,7 +499,7 @@ async def view_trades(update, page: int = 0):
     prices = dict(zip(pairs, res))
 
     sep = "┈┈┈┈┈┈┈┈┈┈┈┈"
-    blocks = [f"<b>معاملات فعال</b>  ·  {len(active)}"]
+    blocks = [f"<b>{title}</b>  ·  {len(active)}"]
     kb = []
     for t in chunk:
         is_open = t["status"] == "open"
@@ -374,21 +531,27 @@ async def view_trades(update, page: int = 0):
         name = B(f"#{t['id']} {t['symbol']} {arrow}", "noop")
         if is_open:
             be = (B("BE ✓", "noop") if t.get("be_active")
-                  else B("Break-even", f"tr:be:{t['id']}"))
-            kb.append([name, be, B("Close", f"tr:close:{t['id']}")])
+                  else B("Break-even", f"tr:be:{t['id']}:{kind}"))
+            kb.append([name, be, B("Close", f"tr:close:{t['id']}:{kind}")])
         else:
-            kb.append([name, B("·", "noop"), B("Cancel", f"tr:cancel:{t['id']}")])
+            kb.append([name, B("Cancel", f"tr:cancel:{t['id']}:{kind}")])
     if pages > 1:
-        kb.append([B("‹", f"trp:{max(page - 1, 0)}"), B(f"{page + 1}/{pages}", "noop"),
-                   B("›", f"trp:{min(page + 1, pages - 1)}")])
-    kb.append([B("بروزرسانی", f"trp:{page}"), B("منو", "menu:home")])
+        kb.append([B("‹", f"trp:{max(page - 1, 0)}:{kind}"), B(f"{page + 1}/{pages}", "noop"),
+                   B("›", f"trp:{min(page + 1, pages - 1)}:{kind}")])
+    kb.append([B("بروزرسانی", f"trp:{page}:{kind}")])
     await show(update, ("\n" + sep + "\n").join(blocks), M(kb))
 
 
 async def view_stats(update):
     closed = [t for t in trades() if t["status"] == "closed" and t["result_r"] is not None]
     if not closed:
-        await show(update, "📈 <b>آمار</b>\n\nهنوز معامله‌ی بسته‌شده‌ای وجود ندارد.", back_kb())
+        pend, opn, _ = _counts()
+        await show(update,
+                   "📈 <b>عملکرد</b>\n\n"
+                   "هنوز نتیجه‌ای برای نمایش نیست.\n"
+                   "عملکرد (مجموع R، Win Rate و …) بعد از بسته‌شدن اولین معامله با TP، SL یا بستن دستی محاسبه می‌شود.\n\n"
+                   f"<blockquote>● پوزیشن باز: <b>{opn}</b>\n◷ پندینگ: <b>{pend}</b></blockquote>",
+                   back_kb())
         return
     rs = [t["result_r"] for t in closed]
     wins = sum(1 for r in rs if r > 0.005)
@@ -402,7 +565,7 @@ async def view_stats(update):
         f"✅ {wins}  ·  ❌ {losses}  ·  ⚪️ {be}",
         f"🥇 بهترین: {fmt_r(max(rs))}  ·  🥀 بدترین: {fmt_r(min(rs))}",
     ]
-    lines = ["📈 <b>آمار کلی</b>", "", "<blockquote>" + "\n".join(body) + "</blockquote>"]
+    lines = ["📈 <b>عملکرد کلی</b>", "", "<blockquote>" + "\n".join(body) + "</blockquote>"]
     per_ch = []
     for c in channels():
         rows = [t["result_r"] for t in closed if t["channel"] == c["key"]]
@@ -425,14 +588,47 @@ async def view_settings(update):
         "<blockquote>"
         f"🏆 پست ریوارد: <b>{rw}</b>\n"
         f"🛡 انتقال SL به Entry: <b>{be}</b>\n"
-        f"⏱ چک قیمت: <b>هر {s['poll_seconds']} ثانیه</b>"
+        f"⏱ چک قیمت: <b>هر {s['poll_seconds']} ثانیه</b>\n"
+        f"📅 گزارش خودکار: <b>{_auto_brief(s)}</b>"
         "</blockquote>"
     )
     tog = "🔕 خاموش کردن ریوارد" if s["reward_on"] else "🔔 روشن کردن ریوارد"
     kb = M([
         [B("🏆 فاصله‌ی ریوارد", "set:rewards"), B(tog, "set:rewtoggle")],
         [B("🛡 Break-even", "set:be"), B("⏱ فاصله‌ی چک", "set:poll")],
-        [B("🏠 منو", "menu:home")],
+        [B("📅 گزارش خودکار", "menu:auto")],
+        [B("⬅️ بازگشت", "menu:home")],
+    ])
+    await show(update, text, kb)
+
+
+def _auto_brief(s: dict) -> str:
+    if not s["auto_on"]:
+        return "خاموش"
+    return f"{s['auto_time']} · " + ("فقط روز سودده" if s["auto_mode"] == "profit" else "هر روز")
+
+
+async def view_auto(update):
+    s = settings()
+    on = s["auto_on"]
+    mode = ("فقط اگر جمع R آن روز مثبت بود" if s["auto_mode"] == "profit"
+            else "همیشه (اگر معامله‌ی بسته‌شده‌ای باشد)")
+    text = (
+        "📅 <b>گزارش خودکار</b>\n\n"
+        "هر روز در ساعت تعیین‌شده، گزارش معاملات بسته‌شده‌ی همان روز به‌صورت جداگانه "
+        "برای هر کانال پست می‌شود.\n\n"
+        "<blockquote>"
+        f"{'✅ فعال' if on else '⛔️ خاموش'}\n"
+        f"⏰ ساعت ارسال: <b>{s['auto_time']}</b>  ({esc(trading.TIMEZONE)})\n"
+        f"🎯 شرط ارسال: <b>{mode}</b>\n"
+        f"🕘 آخرین اجرا: <b>{s.get('auto_last_date') or '—'}</b>"
+        "</blockquote>"
+    )
+    kb = M([
+        [B("🔕 خاموش کردن" if on else "🔔 روشن کردن", "auto:toggle")],
+        [B("⏰ تغییر ساعت", "auto:time"),
+         B("🎯 شرط: " + ("فقط سودده" if s["auto_mode"] == "profit" else "همیشه"), "auto:mode")],
+        [B("⬅️ بازگشت", "menu:settings")],
     ])
     await show(update, text, kb)
 
@@ -443,7 +639,7 @@ async def view_sum(update):
         n = sum(1 for t in trades()
                 if t["channel"] == c["key"] and t["status"] == "closed" and not t["reported"])
         kb.append([B(f"📤 {c['title']} ({n} معامله)", f"sum:go:{c['key']}")])
-    kb.append([B("🏠 منو", "menu:home")])
+    kb.append([B("⬅️ بازگشت", "menu:home")])
     text = ("📊 <b>پست گزارش</b>\n\nگزارش معاملات بسته‌شده‌ی گزارش‌نشده را برای کدام کانال بفرستم؟"
             if channels() else "📊 <b>پست گزارش</b>\n\nهنوز کانالی اضافه نشده است.")
     await show(update, text, M(kb))
@@ -464,7 +660,7 @@ async def view_admin(update):
     if owner:
         rows.append([B("💾 بکاپ داده‌ها", "adm:backup"), B("🧹 پاکسازی تاریخچه", "adm:purge")])
         rows.append([B("🔄 ریستارت بات", "adm:restart")])
-    rows.append([B("🏠 منو", "menu:home")])
+    rows.append([B("⬅️ بازگشت", "menu:home")])
     await show(update, text, M(rows))
 
 
@@ -486,8 +682,16 @@ async def view_admins(update):
         lines.append("ادمین اضافه‌ای وجود ندارد.")
     if owner:
         kb.append([B("➕ افزودن ادمین", "adm:add")])
-    kb.append([B("⬅️ پنل ادمین", "adm:home"), B("🏠 منو", "menu:home")])
+    kb.append([B("⬅️ بازگشت", "adm:home")])
     await show(update, "\n".join(lines), M(kb))
+
+
+def _db_size() -> str:
+    try:
+        kb = DB_PATH.stat().st_size / 1024
+    except OSError:
+        return "—"
+    return f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
 
 
 async def view_status(update):
@@ -512,7 +716,8 @@ async def view_status(update):
         f"📋 فعال: <b>{pend + opn}</b> ({pend} Pending · {opn} Open)\n"
         f"📦 بسته‌شده: <b>{closed}</b> (گزارش‌نشده {unrep})\n"
         f"🚫 کنسل‌شده: <b>{cancelled}</b>\n"
-        f"📺 کانال‌ها: <b>{len(channels())}</b>"
+        f"📺 کانال‌ها: <b>{len(channels())}</b>\n"
+        f"🗄 دیتابیس: <b>{_db_size()}</b>"
         "</blockquote>"
     )
     await show(update, text, M([[B("🔄 بروزرسانی", "adm:status"), B("⬅️ پنل ادمین", "adm:home")]]))
@@ -522,6 +727,82 @@ def _reschedule(job_queue):
     for j in job_queue.get_jobs_by_name("monitor"):
         j.schedule_removal()
     job_queue.run_repeating(monitor, interval=settings()["poll_seconds"], first=3, name="monitor")
+
+
+def _auto_hm() -> tuple:
+    h, m = settings()["auto_time"].split(":")
+    return int(h), int(m)
+
+
+def _reschedule_auto(job_queue):
+    for j in job_queue.get_jobs_by_name("autoreport"):
+        j.schedule_removal()
+    if not settings()["auto_on"]:
+        return
+    h, m = _auto_hm()
+    job_queue.run_daily(auto_report, time=dtime(h, m, tzinfo=TZ), name="autoreport")
+
+
+def _catchup_auto(job_queue):
+    """If the bot was down at report time, send today's report shortly after start."""
+    s = settings()
+    if not s["auto_on"]:
+        return
+    h, m = _auto_hm()
+    now = datetime.now(TZ)
+    if s.get("auto_last_date") != now.date().isoformat() and (now.hour, now.minute) >= (h, m):
+        job_queue.run_once(auto_report, 15, name="autoreport_catchup")
+
+
+def parse_hhmm(text: str):
+    t = text.translate(trading._DIGITS).strip().replace("：", ":").replace(".", ":")
+    m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?", t)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return f"{h:02d}:{mi:02d}"
+
+
+def _closed_between(t, a, b) -> bool:
+    try:
+        ts = datetime.fromisoformat(t["closed_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return a < ts <= b
+
+
+async def auto_report(context: ContextTypes.DEFAULT_TYPE):
+    s = settings()
+    if not s["auto_on"]:
+        return
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=24)
+    if s.get("auto_last_ts"):
+        try:
+            since = max(since, datetime.fromisoformat(s["auto_last_ts"]))
+        except ValueError:
+            pass
+    for ch in list(channels()):
+        rows = [t for t in trades()
+                if t["channel"] == ch["key"] and t["status"] == "closed"
+                and t.get("result_r") is not None and _closed_between(t, since, now)]
+        if not rows:
+            continue
+        if s["auto_mode"] == "profit" and sum(t["result_r"] for t in rows) <= 0.005:
+            continue
+        try:
+            async with LOCK:
+                await _post(ch, trading.summary_text(rows, "Daily Report"))
+                for t in rows:
+                    t["reported"] = True
+                save()
+        except Exception:
+            log.exception("auto report failed for channel %s", ch.get("title"))
+    s["auto_last_ts"] = now.isoformat()
+    s["auto_last_date"] = now.astimezone(TZ).date().isoformat()
+    save()
 
 
 # ====================== Channel posting (bot is the poster) ======================
@@ -572,7 +853,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return
     await reset_flow(context.user_data)
+    await say(update, "👇 برای باز کردن منو، دکمه‌ی «منو» را بزن.", main_kb())
     await view_home(update)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,9 +888,9 @@ async def handle_state(update, context, st, text):
             await say(update, "ℹ️ این کانال قبلاً اضافه شده است.", cancel_kb())
             return
         ud.pop("state", None)
-        add_channel(info["chat"], info["title"], "bot")
+        add_channel(info["chat"], info["title"])
         await say(update, f"✅ کانال «{esc(info['title'])}» اضافه شد.",
-                  M([[B("📺 کانال‌ها", "menu:channels"), B("🏠 منو", "menu:home")]]))
+                  M([[B("⬅️ بازگشت", "menu:channels")]]))
     elif st == "adm_add":
         if not re.fullmatch(r"\d{5,15}", text):
             await say(update, "❌ آیدی عددی تلگرام را بفرست (مثلاً <code>123456789</code>).", cancel_kb())
@@ -617,7 +903,7 @@ async def handle_state(update, context, st, text):
         save()
         ud.pop("state", None)
         await say(update, f"✅ کاربر <code>{uid}</code> به ادمین‌ها اضافه شد.",
-                  M([[B("👥 ادمین‌ها", "adm:list"), B("🏠 منو", "menu:home")]]))
+                  M([[B("⬅️ بازگشت", "adm:list")]]))
     elif st == "set_rewards":
         try:
             v = float(text.translate(trading._DIGITS).replace(",", "."))
@@ -632,7 +918,7 @@ async def handle_state(update, context, st, text):
         save()
         ud.pop("state")
         await say(update, f"✅ از این به بعد هر <b>{fmt_step(v)}</b> ریوارد پست می‌شود.",
-                  M([[B("⚙️ تنظیمات", "menu:settings"), B("🏠 منو", "menu:home")]]))
+                  M([[B("⬅️ بازگشت", "menu:settings")]]))
     elif st == "set_be":
         try:
             v = float(text)
@@ -644,7 +930,18 @@ async def handle_state(update, context, st, text):
         settings()["be_after"] = v
         save()
         ud.pop("state")
-        await say(update, "✅ ذخیره شد.", M([[B("⚙️ تنظیمات", "menu:settings"), B("🏠 منو", "menu:home")]]))
+        await say(update, "✅ ذخیره شد.", M([[B("⬅️ بازگشت", "menu:settings")]]))
+    elif st == "set_autotime":
+        hhmm = parse_hhmm(text)
+        if not hhmm:
+            await say(update, "❌ ساعت نامعتبر است. مثلاً <code>21:30</code> بفرست.", cancel_kb())
+            return
+        settings()["auto_time"] = hhmm
+        save()
+        ud.pop("state", None)
+        _reschedule_auto(context.job_queue)
+        await say(update, f"✅ ساعت گزارش خودکار روی <b>{hhmm}</b> تنظیم شد.",
+                  M([[B("⬅️ بازگشت", "menu:auto")]]))
     elif st == "set_poll":
         if not text.isdigit() or not 2 <= int(text) <= 60:
             await say(update, "❌ عددی بین 2 تا 60 بفرست.", cancel_kb())
@@ -653,7 +950,7 @@ async def handle_state(update, context, st, text):
         save()
         ud.pop("state")
         _reschedule(context.job_queue)
-        await say(update, "✅ ذخیره شد.", M([[B("⚙️ تنظیمات", "menu:settings"), B("🏠 منو", "menu:home")]]))
+        await say(update, "✅ ذخیره شد.", M([[B("⬅️ بازگشت", "menu:settings")]]))
 
 
 async def handle_signal(update, context, text):
@@ -682,6 +979,14 @@ async def handle_signal(update, context, text):
 @admin_only
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    if text == MENU_LABEL:  # Telegram-keyboard button: cancel pending input, open the main menu
+        await reset_flow(context.user_data)
+        await view_home(update)
+        return
+    if text in (PEND_LABEL, POS_LABEL):  # persistent-keyboard shortcuts
+        await reset_flow(context.user_data)
+        await view_trades(update, 0, "p" if text == PEND_LABEL else "o")
+        return
     st = context.user_data.get("state")
     if st:
         await handle_state(update, context, st, text)
@@ -711,11 +1016,43 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_flow(ud)
         views = {"home": view_home, "channels": view_channels,
                  "trades": view_trades, "settings": view_settings, "sum": view_sum,
-                 "stats": view_stats, "help": view_help}
+                 "stats": view_stats, "help": view_help,
+                 "auto": view_auto}
         await views.get(p[1], view_home)(update)
 
     elif a == "trp":
-        await view_trades(update, int(p[1]))
+        await view_trades(update, int(p[1]), p[2] if len(p) > 2 else "a")
+
+    # ---------- auto report ----------
+    elif a == "auto":
+        sub = p[1]
+        s = settings()
+        if sub == "toggle":
+            s["auto_on"] = not s["auto_on"]
+            save()
+            _reschedule_auto(context.job_queue)
+            await view_auto(update)
+        elif sub == "mode":
+            s["auto_mode"] = "always" if s["auto_mode"] == "profit" else "profit"
+            save()
+            await view_auto(update)
+        elif sub == "time":
+            ud["state"] = "set_autotime"
+            presets = [("20:00", "2000"), ("21:00", "2100"), ("22:00", "2200"),
+                       ("23:00", "2300"), ("23:55", "2355")]
+            kb = M([[B(l, f"auto:t:{v}") for l, v in presets[:3]],
+                    [B(l, f"auto:t:{v}") for l, v in presets[3:]],
+                    [B("✖️ انصراف", "menu:auto")]])
+            await show(update, "⏰ <b>ساعت گزارش خودکار</b>\n\n"
+                               f"ساعت را به وقت <b>{esc(trading.TIMEZONE)}</b> بفرست، مثلاً <code>21:30</code>، "
+                               "یا از دکمه‌ها انتخاب کن.", kb)
+        elif sub == "t":
+            v = p[2]
+            s["auto_time"] = f"{v[:2]}:{v[2:]}"
+            ud.pop("state", None)
+            save()
+            _reschedule_auto(context.job_queue)
+            await view_auto(update)
 
     # ---------- admin panel ----------
     elif a == "adm":
@@ -741,13 +1078,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save()
             await view_admins(update)
         elif sub == "backup":
+            tmp = None
             try:
-                data = Path(DATA_FILE).read_bytes()
-                name = f"magical_org_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-                await q.message.reply_document(document=data, filename=name,
-                                               caption="💾 بکاپ data.json\n(سشن‌ها و کلیدها شامل نمی‌شوند)")
+                tmp = make_backup()
+                name = f"magical_org_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
+                await q.message.reply_document(document=tmp.read_bytes(), filename=name,
+                                               caption="💾 بکاپ دیتابیس (SQLite)\nکانال‌ها، معاملات، تاریخچه و تنظیمات")
             except Exception as ex:
                 await q.message.reply_text(f"❌ {esc(str(ex))}", parse_mode=ParseMode.HTML)
+            finally:
+                if tmp:
+                    tmp.unlink(missing_ok=True)
         elif sub == "purge":
             n = sum(1 for t in trades()
                     if t["status"] == "cancelled" or (t["status"] == "closed" and t["reported"]))
@@ -760,7 +1101,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               if not (t["status"] == "cancelled" or (t["status"] == "closed" and t["reported"]))]
             save()
             await show(update, f"✅ {before - len(trades())} معامله پاک شد.",
-                       M([[B("⬅️ پنل ادمین", "adm:home"), B("🏠 منو", "menu:home")]]))
+                       M([[B("⬅️ بازگشت", "adm:home")]]))
         elif sub == "restart":
             await show(update, "🔄 <b>ریستارت بات</b>\n\nبات چند ثانیه آفلاین می‌شود و سرویس systemd دوباره آن را بالا می‌آورد.",
                        confirm_kb("adm:restartok", "adm:home", "✅ ریستارت"))
@@ -824,16 +1165,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show(update, f"❌ ارسال ناموفق: <code>{esc(str(ex))}</code>", back_kb())
                 return
         await show(update, f"✅ معامله‌ی <b>#{t['id']}</b> در «{esc(ch['title'])}» پست شد و زیر نظر است.",
-                   M([[B("📋 معاملات فعال", "menu:trades"), B("🏠 منو", "menu:home")]]))
+                   M([[B("📋 معاملات فعال", "menu:trades"), B("⬅️ بازگشت", "menu:home")]]))
 
     # ---------- trades ----------
     elif a == "tr":
         tid = int(p[2])
+        kind = p[3] if len(p) > 3 else "a"
         t = get_trade(tid)
         async with LOCK:
             ch = t and get_channel(t["channel"])
             if not t or not ch:
-                await view_trades(update)
+                await view_trades(update, 0, kind)
                 return
             try:
                 if p[1] == "cancel" and t["status"] == "pending":
@@ -869,7 +1211,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as ex:
                 await q.message.reply_text(f"❌ {esc(str(ex))}", parse_mode=ParseMode.HTML)
                 return
-        await view_trades(update)
+        await view_trades(update, 0, kind)
 
     # ---------- settings ----------
     elif a == "set":
@@ -1000,13 +1342,17 @@ async def post_init(app: Application):
         me = await app.bot.get_me()
         if me.first_name != BOT_NAME:
             await app.bot.set_my_name(BOT_NAME)
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         await app.bot.set_my_commands([
+            BotCommand("menu", "منوی اصلی"),
             BotCommand("start", "پنل مدیریت"),
             BotCommand("help", "راهنما"),
         ])
     except Exception as ex:
         log.warning("bot profile setup failed: %s", ex)
     _reschedule(app.job_queue)
+    _reschedule_auto(app.job_queue)
+    _catchup_auto(app.job_queue)
 
 
 def main():
@@ -1014,11 +1360,20 @@ def main():
         raise SystemExit("Set BOT_TOKEN and ADMIN_IDS in the .env file.")
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("menu", cmd_menu, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("help", cmd_help, filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_error_handler(on_error)
-    app.run_polling()
+    db()  # open the database (and import data.json on first run)
+    try:
+        app.run_polling()
+    finally:
+        try:
+            save()
+            get_conn().close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
