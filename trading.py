@@ -53,6 +53,12 @@ def fa_date(dt: datetime = None) -> str:
     return f"{_DAYS[dt.weekday()]} {to_fa(jd)} {_MONTHS[jm - 1]} {to_fa(jy)}"
 
 
+def fa_datetime(dt: datetime = None) -> str:
+    """Jalali date + local time, e.g. 'جمعه ۱۰ مهر ۱۴۰۵ · ساعت ۱۵:۵۸'."""
+    dt = dt or datetime.now(ZoneInfo(TIMEZONE))
+    return f"{fa_date(dt)}  ·  ساعت {to_fa(dt.strftime('%H:%M'))}"
+
+
 def fmt_price(x: float) -> str:
     s = f"{x:,.4f}" if abs(x) >= 1 else f"{x:.8f}"
     if "." in s:
@@ -212,11 +218,11 @@ def order_type(side: str, entry: float, price: float) -> str:
 
 
 def _pending_kind(t):
-    """(emoji, label): blue = Limit, yellow = Stop. Old trades without a type stay yellow."""
+    """(emoji, label): colour by direction while still pending: blue = Buy, orange = Sell."""
+    emoji = "🔵" if t["side"] == "LONG" else "🟠"
     kind = t.get("order")
     if kind not in ("limit", "stop"):
-        return "🟡", "Pending"
-    emoji = "🔵" if kind == "limit" else "🟡"
+        return emoji, "Pending"
     side = "Buy" if t["side"] == "LONG" else "Sell"
     return emoji, f"Pending {side} {kind.capitalize()}"
 
@@ -231,42 +237,51 @@ def pending_text(t):
         f"SL   {fmt_price(t['sl'])}\n"
         f"R/R   {fmt_rr(t['rr'])}\n"
         f"{LINE}\n"
-        f"{fa_date()}"
+        f"{fa_datetime()}"
     )
 
 
 # Replies carry no date: they are short status lines under the original post.
 
 def open_text(t):
-    return f"🟢 Position {t['no']}  ·  Opened"
+    return f"Position {t['no']}  ·  Opened✅"
 
 
 def cancel_text(t):
-    return "⚪️ Pending order cancelled"
+    return f"Position {t['no']}  ·  Cancelled🚫"
 
 
 def reward_text(t, step):
-    return f"🟢 Position {t['no']}  ·  Reward {fmt_step(step)}  ·  In Profit"
+    return f"Position {t['no']}  ·  {fmt_step(step)} in Profit🔥"
+
+
+def tp_marks(r) -> str:
+    """One ✅ per full R reached (2R -> ✅✅, 3.5R -> ✅✅✅), at least one, max 30."""
+    try:
+        n = int(float(r) + 1e-9)
+    except (TypeError, ValueError):
+        n = 1
+    return "✅" * max(1, min(30, n))
 
 
 def tp_text(t):
-    return f"🟢 Position {t['no']}  ·  Take Profit  ·  <b>{fmt_r(t['result_r'])}</b>"
+    return f"Position {t['no']}  ·  Take Profit  ·  <b>{fmt_r(t['result_r'])}</b>{tp_marks(t['result_r'])}"
 
 
 def sl_text(t):
-    return f"🔴 Position {t['no']}  ·  Stop Loss  ·  <b>{fmt_r(t['result_r'])}</b>"
+    return f"Position {t['no']}  ·  Stop Loss  ·  <b>{fmt_r(t['result_r'])}</b>❌"
 
 
 def be_text(t):
-    return f"⚪️ Position {t['no']}  ·  Break-even  ·  <b>0R</b>"
+    return f"Position {t['no']}  ·  Break-even⚖️"
 
 
 def be_set_text(t):
-    return f"⚪️ Position {t['no']}  ·  Stop moved to Entry  ·  Risk-free"
+    return f"Position {t['no']}  ·  Risk-free🌱"
 
 
 def manual_text(t):
-    return f"⚪️ Position {t['no']}  ·  Closed manually  ·  <b>{fmt_r(t['result_r'])}</b>"
+    return f"Position {t['no']}  ·  Closed at <b>{fmt_r(t['result_r'])}</b>✋"
 
 
 def final_text(t):
