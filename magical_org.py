@@ -34,6 +34,7 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+import chart
 import trading
 from trading import fmt_price, fmt_r, fmt_rr, fmt_step
 
@@ -84,7 +85,8 @@ DEFAULTS = {
     "trade_counter": 0,
     "settings": {"reward_on": True, "reward_every": 1, "be_after": 0, "poll_seconds": 5,
                  "auto_on": False, "auto_time": "21:00", "auto_mode": "always",
-                 "auto_last_ts": "", "auto_last_date": ""},
+                 "auto_last_ts": "", "auto_last_date": "",
+                 "img_on": False, "img_tf": "15m"},
 }
 
 _SCHEMA = """
@@ -589,7 +591,8 @@ async def view_settings(update):
         f"🏆 پست ریوارد: <b>{rw}</b>\n"
         f"🛡 انتقال SL به Entry: <b>{be}</b>\n"
         f"⏱ چک قیمت: <b>هر {s['poll_seconds']} ثانیه</b>\n"
-        f"📅 گزارش خودکار: <b>{_auto_brief(s)}</b>"
+        f"📅 گزارش خودکار: <b>{_auto_brief(s)}</b>\n"
+        f"🖼 عکس ورود: <b>{('روشن · ' + s['img_tf']) if s['img_on'] else 'خاموش'}</b>"
         "</blockquote>"
     )
     tog = "🔕 خاموش کردن ریوارد" if s["reward_on"] else "🔔 روشن کردن ریوارد"
@@ -597,6 +600,9 @@ async def view_settings(update):
         [B("🏆 فاصله‌ی ریوارد", "set:rewards"), B(tog, "set:rewtoggle")],
         [B("🛡 Break-even", "set:be"), B("⏱ فاصله‌ی چک", "set:poll")],
         [B("📅 گزارش خودکار", "menu:auto")],
+        [B("🖼 خاموش کردن عکس ورود" if s["img_on"] else "🖼 روشن کردن عکس ورود", "set:imgtoggle"),
+         B(f"🕯 تایم‌فریم: {s['img_tf']}", "set:imgtf")],
+        [B("👁 نمونه‌ی عکس", "set:imgtest")],
         [B("⬅️ بازگشت", "menu:home")],
     ])
     await show(update, text, kb)
@@ -834,6 +840,28 @@ async def _post(ch, text, reply_to=None):
     m = await BOT.send_message(chat_id=ch["chat"], text=text, parse_mode=ParseMode.HTML,
                                reply_parameters=rp, disable_web_page_preview=True)
     return m.message_id
+
+
+async def _post_photo(ch, png: bytes, caption: str, reply_to=None):
+    rp = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
+    m = await BOT.send_photo(chat_id=ch["chat"], photo=png, caption=caption,
+                             parse_mode=ParseMode.HTML, reply_parameters=rp)
+    return m.message_id
+
+
+async def _post_open(ch, t, price):
+    """'Position Opened' reply. With entry image on: chart photo + caption, else plain text."""
+    text = trading.open_text(t)
+    s = settings()
+    if s.get("img_on"):
+        try:
+            png = await chart.snapshot(await trading._sess(), t, s.get("img_tf", "15m"),
+                                       price, BOT_NAME)
+            if png:
+                return await _post_photo(ch, png, text, t["pending_msg_id"])
+        except Exception:
+            log.exception("entry image failed for trade %s, sending text", t.get("id"))
+    return await _post(ch, text, t["pending_msg_id"])
 
 
 # ====================== Commands (/start, /help only) ======================
@@ -1220,6 +1248,32 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save()
             await view_settings(update)
             return
+        if p[1] == "imgtoggle":
+            settings()["img_on"] = not settings()["img_on"]
+            save()
+            await view_settings(update)
+            return
+        if p[1] == "imgtf":
+            tfs = chart.TIMEFRAMES
+            cur_tf = settings().get("img_tf", "15m")
+            settings()["img_tf"] = tfs[(tfs.index(cur_tf) + 1) % len(tfs)] if cur_tf in tfs else "15m"
+            save()
+            await view_settings(update)
+            return
+        if p[1] == "imgtest":
+            price = await trading.get_price("BTCUSDT")
+            if price is None:
+                await q.message.reply_text("❌ قیمت BTC دریافت نشد.")
+                return
+            demo = {"pair": "BTCUSDT", "symbol": "BTC", "side": "LONG", "entry": price,
+                    "sl": round(price * 0.995, 1), "tp": round(price * 1.01, 1), "no": 0}
+            png = await chart.snapshot(await trading._sess(), demo,
+                                       settings().get("img_tf", "15m"), price, BOT_NAME)
+            if not png:
+                await q.message.reply_text("❌ ساخت عکس ناموفق بود (کندل‌ها دریافت نشد).")
+                return
+            await q.message.reply_photo(png, caption="👁 نمونه‌ی عکس ورود (BTC LONG، 1:2)")
+            return
         ud["state"] = {"rewards": "set_rewards", "be": "set_be", "poll": "set_poll"}[p[1]]
         prompts = {
             "rewards": "🏆 <b>فاصله‌ی ریوارد</b>\n\n"
@@ -1268,7 +1322,7 @@ async def _process(t, cur):
         if (prev - e) * (cur - e) > 0:
             t["last_price"] = cur
             return
-        t["open_msg_id"] = await _post(ch, trading.open_text(t), t["pending_msg_id"])
+        t["open_msg_id"] = await _post_open(ch, t, cur)
         t["status"] = "open"
         t["opened_at"] = datetime.now(timezone.utc).isoformat()
         save()
