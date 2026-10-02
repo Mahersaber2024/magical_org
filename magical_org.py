@@ -229,6 +229,56 @@ def make_backup() -> Path:
     return Path(tmp)
 
 
+# ---------- restore ----------
+_REQUIRED_TABLES = {"kv", "admins", "channels", "trades"}
+
+
+def inspect_backup(path: Path) -> dict:
+    """Validate an uploaded backup. Returns counts, raises ValueError if it is not usable."""
+    with open(path, "rb") as f:
+        if f.read(16) != b"SQLite format 3\x00":
+            raise ValueError("این فایل دیتابیس SQLite نیست.")
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("فایل بکاپ خراب است (integrity check).")
+        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not _REQUIRED_TABLES <= tables:
+            raise ValueError("این فایل بکاپ magical_org نیست (جدول‌ها ناقص‌اند).")
+        if not c.execute("SELECT 1 FROM kv WHERE key='initialized'").fetchone():
+            raise ValueError("بکاپ خالی یا ناقص است.")
+        st = dict(c.execute("SELECT status, COUNT(*) FROM trades GROUP BY status").fetchall())
+        return {
+            "channels": c.execute("SELECT COUNT(*) FROM channels").fetchone()[0],
+            "admins": c.execute("SELECT COUNT(*) FROM admins").fetchone()[0],
+            "trades": sum(st.values()),
+            "active": st.get("pending", 0) + st.get("open", 0),
+        }
+    finally:
+        c.close()
+
+
+def restore_backup(src: Path) -> Path:
+    """Swap the live database with `src`. The current data is saved first; returns that copy."""
+    global _conn, _data
+    save()
+    keep_dir = BASE_DIR / "backups"
+    keep_dir.mkdir(exist_ok=True)
+    before = keep_dir / f"before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    tmp = make_backup()
+    os.replace(tmp, before)
+    if _conn is not None:
+        _conn.close()
+        _conn = None
+    for suffix in ("-wal", "-shm"):
+        Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+    os.replace(src, DB_PATH)
+    _data = None
+    _snap.update(counter=None, settings=None, admins=set(), channels={}, trades={})
+    db()  # load the restored database into memory
+    return before
+
+
 def settings() -> dict:
     return db()["settings"]
 
@@ -439,6 +489,9 @@ def _counts():
 async def reset_flow(ud: dict):
     for k in ("state", "draft"):
         ud.pop(k, None)
+    f = ud.pop("restore_file", None)
+    if f:
+        Path(f).unlink(missing_ok=True)
 
 
 # ====================== Views ======================
@@ -665,7 +718,7 @@ async def view_admin(update):
     rows = [[B("👥 ادمین‌ها", "adm:list"), B("🖥 وضعیت سیستم", "adm:status")]]
     if owner:
         rows.append([B("💾 بکاپ داده‌ها", "adm:backup"), B("🧹 پاکسازی تاریخچه", "adm:purge")])
-        rows.append([B("🔄 ریستارت بات", "adm:restart")])
+        rows.append([B("♻️ ریستور بکاپ", "adm:restore"), B("🔄 ریستارت بات", "adm:restart")])
     rows.append([B("⬅️ بازگشت", "menu:home")])
     await show(update, text, M(rows))
 
@@ -1022,6 +1075,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_signal(update, context, text)
 
 
+MAX_BACKUP_MB = 20  # Telegram bots can download files up to 20 MB
+
+
+@admin_only
+async def on_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
+    if ud.get("state") != "restore_wait" or not is_owner(update.effective_user.id):
+        await say(update, "📎 برای ریستور، از 🛡 پنل ادمین ← ♻️ ریستور بکاپ شروع کن.", home_kb())
+        return
+    doc = update.message.document
+    if doc.file_size and doc.file_size > MAX_BACKUP_MB * 1024 * 1024:
+        await say(update, f"❌ فایل بزرگ‌تر از {MAX_BACKUP_MB} مگابایت است.", cancel_kb())
+        return
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        await (await doc.get_file()).download_to_drive(tmp)
+        info = inspect_backup(Path(tmp))
+    except Exception as ex:
+        Path(tmp).unlink(missing_ok=True)
+        await say(update, f"❌ {esc(str(ex))}\nیک فایل بکاپ سالم بفرست.", cancel_kb())
+        return
+    old = ud.pop("restore_file", None)
+    if old:
+        Path(old).unlink(missing_ok=True)
+    ud["restore_file"] = tmp
+    await say(update, "♻️ <b>بکاپ معتبر است</b>\n\n<blockquote>"
+                      f"📄 {esc(doc.file_name or 'backup.db')}\n"
+                      f"📺 کانال‌ها: <b>{info['channels']}</b>\n"
+                      f"📋 معاملات: <b>{info['trades']}</b> (فعال: {info['active']})\n"
+                      f"🛡 ادمین‌ها: <b>{info['admins']}</b></blockquote>\n"
+                      "⚠️ دیتای فعلی با این بکاپ <b>جایگزین</b> می‌شود (یک نسخه از دیتای فعلی نگه داشته می‌شود). ادامه؟",
+              confirm_kb("adm:restoreok", "menu:home", "♻️ بله، ریستور کن"))
+
+
 # ====================== Callbacks ======================
 
 @admin_only
@@ -1130,6 +1218,40 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save()
             await show(update, f"✅ {before - len(trades())} معامله پاک شد.",
                        M([[B("⬅️ بازگشت", "adm:home")]]))
+        elif sub == "restore":
+            await reset_flow(ud)
+            ud["state"] = "restore_wait"
+            await show(update, "♻️ <b>ریستور بکاپ</b>\n\n"
+                               "فایل بکاپ (<code>.db</code>) را همین‌جا به‌صورت <b>فایل</b> بفرست.\n"
+                               "قبل از جایگزینی، از دیتای فعلی خودکار بکاپ گرفته می‌شود.", cancel_kb())
+        elif sub == "restoreok":
+            f = ud.pop("restore_file", None)
+            ud.pop("state", None)
+            if not f or not Path(f).exists():
+                await show(update, "❌ فایل بکاپ پیدا نشد، دوباره بفرست.", M([[B("⬅️ بازگشت", "adm:home")]]))
+                return
+            try:
+                async with LOCK:
+                    before = restore_backup(Path(f))
+                _reschedule(context.job_queue)
+                _reschedule_auto(context.job_queue)
+            except Exception as ex:
+                log.exception("restore failed")
+                Path(f).unlink(missing_ok=True)
+                await show(update, f"❌ ریستور ناموفق: <code>{esc(str(ex))}</code>",
+                           M([[B("⬅️ بازگشت", "adm:home")]]))
+                return
+            pend, opn, _ = _counts()
+            await show(update, "✅ <b>ریستور انجام شد</b>\n\n<blockquote>"
+                               f"📺 کانال‌ها: <b>{len(channels())}</b>\n"
+                               f"📋 معاملات: <b>{len(trades())}</b> (فعال: {pend + opn})\n"
+                               f"🛡 ادمین‌ها: <b>{len(db()['admins'])}</b></blockquote>\n"
+                               "قیمت‌ها از همین الان دوباره چک می‌شوند.", M([[B("⬅️ بازگشت", "adm:home")]]))
+            try:
+                await q.message.reply_document(document=before.read_bytes(), filename=before.name,
+                                               caption="💾 دیتای قبل از ریستور (برای احتیاط)")
+            except Exception:
+                pass
         elif sub == "restart":
             await show(update, "🔄 <b>ریستارت بات</b>\n\nبات چند ثانیه آفلاین می‌شود و سرویس systemd دوباره آن را بالا می‌آورد.",
                        confirm_kb("adm:restartok", "adm:home", "✅ ریستارت"))
@@ -1418,6 +1540,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help, filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_doc))
     app.add_error_handler(on_error)
     db()  # open the database (and import data.json on first run)
     try:
