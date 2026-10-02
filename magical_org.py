@@ -1075,6 +1075,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_signal(update, context, text)
 
 
+RESTORE_HOWTO = (
+    "♻️ <b>نحوه‌ی ریستور</b>\n"
+    "۱) /start ← 🛡 پنل ادمین ← ♻️ ریستور بکاپ\n"
+    "۲) همین فایل را بدون تغییر به‌صورت <b>فایل</b> برای بات بفرست\n"
+    "۳) خلاصه را چک کن و «♻️ بله، ریستور کن» را بزن\n"
+    "<i>از دیتای فعلی خودکار یک نسخه گرفته می‌شود. فقط مالک می‌تواند ریستور کند.</i>"
+)
+BACKUP_CAPTION = ("💾 <b>بکاپ دیتابیس</b> (SQLite)\n"
+                  "کانال‌ها، معاملات، تاریخچه و تنظیمات\n\n" + RESTORE_HOWTO)
+
 MAX_BACKUP_MB = 20  # Telegram bots can download files up to 20 MB
 
 
@@ -1199,7 +1209,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tmp = make_backup()
                 name = f"magical_org_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
                 await q.message.reply_document(document=tmp.read_bytes(), filename=name,
-                                               caption="💾 بکاپ دیتابیس (SQLite)\nکانال‌ها، معاملات، تاریخچه و تنظیمات")
+                                               caption=BACKUP_CAPTION, parse_mode=ParseMode.HTML)
             except Exception as ex:
                 await q.message.reply_text(f"❌ {esc(str(ex))}", parse_mode=ParseMode.HTML)
             finally:
@@ -1249,7 +1259,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                "قیمت‌ها از همین الان دوباره چک می‌شوند.", M([[B("⬅️ بازگشت", "adm:home")]]))
             try:
                 await q.message.reply_document(document=before.read_bytes(), filename=before.name,
-                                               caption="💾 دیتای قبل از ریستور (برای احتیاط)")
+                                               caption="💾 <b>دیتای قبل از ریستور</b> (برای احتیاط)\n\n" + RESTORE_HOWTO,
+                                               parse_mode=ParseMode.HTML)
             except Exception:
                 pass
         elif sub == "restart":
