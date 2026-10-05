@@ -26,7 +26,6 @@ _TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 UP, DOWN = "#089981", "#F23645"
 TP_FILL, SL_FILL = "#089981", "#F23645"
 GRID, TEXT, BG = "#F0F3FA", "#787B86", "#FFFFFF"
-VISIBLE = 50  # candles shown on the chart (zoom level: smaller = more zoomed in)
 
 
 # name, icon colour, icon glyph (TradingView-like legend)
@@ -177,22 +176,15 @@ def render(t: dict, candles: list, tf: str = "15m", price: float = None, brand: 
     price = float(price if price is not None else candles[-1][4])
     n = len(candles)
     w = 0.62  # candle body width in index units
+    box_len = max(18, n // 4)           # minimum position box width (candles)
     x0 = n - 1
     if start is not None:
         x0 = 0
         for i, c in enumerate(candles):
             if c[0] <= start:
                 x0 = i
-    # zoom: show only the last VISIBLE candles (more if the box starts earlier, so the
-    # activation candle and a few candles before it always stay on the chart)
-    cut = max(0, min(n - VISIBLE, x0 - 8))
-    if cut:
-        candles = candles[cut:]
-        x0 -= cut
-        n = len(candles)
     if ahead > 0:
         x0 = n - 1 + ahead
-    box_len = max(14, n // 4)           # minimum position box width (candles)
     x1 = max(x0 + box_len, n - 1 + 6)
 
     fig, ax = plt.subplots(figsize=(10, 6.2), dpi=120)
@@ -227,7 +219,7 @@ def render(t: dict, candles: list, tf: str = "15m", price: float = None, brand: 
     ax.hlines([tp], x0, x1, color=TP_FILL, lw=0.8, alpha=0.6, zorder=4)
     ax.hlines([sl], x0, x1, color=SL_FILL, lw=0.8, alpha=0.6, zorder=4)
 
-    risk = abs(entry - sl) or 1e-12
+    risk = float(t.get("risk0") or abs(entry - sl)) or 1e-12  # 1R fixed at open
     tp_pct = abs(tp - entry) / entry * 100
     sl_pct = abs(sl - entry) / entry * 100
     rr = abs(tp - entry) / risk
@@ -260,7 +252,7 @@ def render(t: dict, candles: list, tf: str = "15m", price: float = None, brand: 
     # symmetric range around the box center, wide enough to still show every candle
     mid = (tp + sl) / 2
     half = max(hi - mid, mid - lo, 1e-12)
-    pad = half * 0.10
+    pad = half * 0.16
     ax.set_ylim(mid - half - pad, mid + half + pad)
     # empty right margin after the box, like TradingView's space before the price scale
     # left: candles run off the edge (no white gap), right: empty margin like TradingView

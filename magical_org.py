@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup as M, ReplyParameters, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup as M, InputMediaPhoto, ReplyParameters, Update
 from telegram import __version__ as PTB_VERSION
 try:
     from telegram import CopyTextButton  # python-telegram-bot >= 21.7
@@ -89,8 +89,8 @@ DEFAULTS = {
                  "img_events": {"pending": False, "entry": False, "reward": False, "tp": False,
                                 "sl": False, "cancel": False},
                  "img_labels": False,
-                 "near_on": False, "near_pct": 20,
-                 "tp_cancel_on": False, "tp_cancel_mode": "delete",
+                 "near_on": False, "near_pct": 30, "near_basis": "sl",
+                 "tp_cancel_on": False, "tp_cancel_mode": "delete", "opp_cancel_on": True,
                  "img_tf": "15m"},
 }
 
@@ -136,6 +136,10 @@ def _normalize(d: dict):
         st["reward_every"] = float(min(st["reward_steps"]))
     if "img_events" not in st and "img_on" in st:  # migrate old single "entry image" switch
         st["img_events"] = {"entry": bool(st.pop("img_on"))}
+    if st and st.get("near_basis") != "sl":  # near % now = share of the Entry->SL distance (1R)
+        if not 1 <= float(st.get("near_pct", 30)) <= 100:
+            st["near_pct"] = 30
+        st["near_basis"] = "sl"
     for k, v in DEFAULTS.items():
         d.setdefault(k, copy.deepcopy(v))
     for k, v in DEFAULTS["settings"].items():
@@ -325,10 +329,22 @@ def active_trades(channel_key: str = None) -> list:
             and (channel_key is None or t["channel"] == channel_key)]
 
 
+def _ref_price(t):
+    """Market price when the signal was sent (reference for the near-entry distance)."""
+    return t.get("signal_price") or t.get("price") or t.get("last_price") or t["entry"]
+
+
 def near_band(t) -> float:
     """Distance from Entry (price units) at which a waiting signal gets posted:
-    near_pct % of the position's reward distance |TP - Entry|."""
-    return abs(t["tp"] - t["entry"]) * float(settings().get("near_pct", 20)) / 100
+    near_pct % of the stop-loss distance |Entry - SL| (1R).
+    e.g. Entry 86,930 · SL 86,280 → 650 · 30% → 195 → post within 195 of Entry."""
+    return abs(t["entry"] - t["sl"]) * float(settings().get("near_pct", 30)) / 100
+
+
+def near_trigger(t) -> float:
+    """The price at which a waiting signal gets posted (on the market side of Entry)."""
+    ref = _ref_price(t)
+    return t["entry"] + (near_band(t) if ref >= t["entry"] else -near_band(t))
 
 
 def pct(v) -> str:
@@ -375,6 +391,7 @@ def create_trade(draft: dict, channel: dict) -> dict:
         "reported": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "last_price": draft["price"],
+        "signal_price": draft["price"],  # market price at signal time (near-entry reference)
     }
     for k in ("pair", "symbol", "side", "entry", "tp", "sl", "rr", "order"):
         t[k] = draft[k]
@@ -430,6 +447,10 @@ HELP = (
     "<b>چرخه‌ی معامله</b>\n"
     "Pending ← Position Opened ← Reward ها ← TP / SL\n"
     "همه‌ی مراحل به‌صورت ریپلای روی پست اصلی ارسال می‌شوند.\n\n"
+    "<b>ویرایش</b>\n"
+    "در لیست پندینگ/پوزیشن روی نام معامله (مثلاً <code>#12 BTC ↑</code>) بزن و «📋 کپی قالب» را بزن؛ "
+    "عدد را عوض کن و بفرست؛ بات خودش می‌فهمد چه چیزی عوض شده.\n"
+    "پندینگ: Int / Tp / Sl ، پوزیشن باز: فقط Tp / Sl. تغییر در کانال اعلام می‌شود.\n\n"
     "<b>مدیریت</b>\n"
     "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند.\n"
     "گزارش روزانه‌ی خودکار از «تنظیمات ← گزارش خودکار» قابل تنظیم است."
@@ -583,17 +604,19 @@ async def view_trades(update, page: int = 0, kind: str = "a", notice: str = ""):
         cur = prices.get(t["pair"])
         r = None
         if cur is not None and is_open:
-            risk = abs(t["entry"] - t["sl"])
+            risk = trading.risk_of(t)
             d = 1 if t["side"] == "LONG" else -1
             r = d * (cur - t["entry"]) / risk
 
         # header + status
         waiting = t["status"] == "waiting"
         status = "Open" if is_open else (
-            f"⌖ Waiting · ±{fmt_price(near_band(t))}" if waiting else "Pending")
+            f"⌖ Waiting · @{fmt_price(near_trigger(t))}" if waiting else "Pending")
         if is_open and r is not None:
             status += f"  ·  <b>{fmt_r(r)}</b>"
-        head = f"<b>#{t['id']}  {esc(t['symbol'])} {t['side']}</b>  ·  {status}"
+        chn = get_channel(t["channel"])
+        head = (f"<b>#{t['id']}  {esc(t['symbol'])} {t['side']}</b>  ·  {status}"
+                f"  |  {esc(chn['title']) if chn else '—'}")
 
         # body
         body = [f"Entry {fmt_price(t['entry'])}   TP {fmt_price(t['tp'])}   SL {fmt_price(t['sl'])}"]
@@ -607,7 +630,7 @@ async def view_trades(update, page: int = 0, kind: str = "a", notice: str = ""):
         blocks.append(head + "\n" + "\n".join(body))
 
         # buttons: [name] [Send Pic] [break-even] [close]   /   [name] [Send Pic] [cancel]
-        name = B(f"#{t['id']} {t['symbol']} {arrow}", "noop")
+        name = edit_button(t, f"#{t['id']} {t['symbol']} {arrow}", kind)
         pic = B("Send Pic", f"tr:pic:{t['id']}:{kind}")
         if is_open:
             be = (B("BE ✓", "noop") if t.get("be_active")
@@ -738,21 +761,26 @@ def _pend_brief(s: dict) -> str:
         parts.append(f"نزدیک ورود {pct(s['near_pct'])}%")
     if s.get("tp_cancel_on"):
         parts.append("کنسل با TP")
+    if s.get("opp_cancel_on", True):
+        parts.append("کنسل خلاف جهت")
     return " · ".join(parts) if parts else "خاموش"
 
 
 async def view_pend(update):
     s = settings()
     del_mode = s.get("tp_cancel_mode", "delete") == "delete"
-    near = (pct(s['near_pct']) + '% فاصله‌ی TP') if s.get('near_on') else 'خاموش'
+    near = (pct(s['near_pct']) + '% فاصله‌ی SL') if s.get('near_on') else 'خاموش'
     tpc = (("حذف پست" if del_mode else "پست کنسل") if s.get("tp_cancel_on") else "خاموش")
+    opp = "روشن" if s.get("opp_cancel_on", True) else "خاموش"
     text = (
         "◷ <b>تنظیمات پندینگ</b>\n\n"
         "<blockquote>"
         f"⌖ ارسال نزدیک ورود  ·  <b>{near}</b>\n"
-        f"⊘ کنسل با رسیدن به TP  ·  <b>{tpc}</b>"
+        f"⊘ کنسل با رسیدن به TP  ·  <b>{tpc}</b>\n"
+        f"⇄ کنسل پندینگ خلاف جهت  ·  <b>{opp}</b>"
         "</blockquote>\n"
         "<i>کنسل با TP: اگر قیمت بدون فعال‌کردن Entry به TP برسد، پندینگ کنسل می‌شود.\n"
+        "خلاف جهت: وقتی پندینگ Buy یک نماد فعال شود، پندینگ‌های Sell همان نماد در همان کانال کنسل می‌شوند (و برعکس).\n"
         "حذف پست = پیام پندینگ از کانال پاک می‌شود · پست کنسل = ریپلای کنسل زیرش می‌آید</i>"
     )
     kb = M([
@@ -760,6 +788,7 @@ async def view_pend(update):
          B("⌖ درصد نزدیکی", "set:near")],
         [B(f"{ON if s.get('tp_cancel_on') else OFF} کنسل با TP", "set:tpctoggle"),
          B("⊘ حالت: " + ("حذف پست" if del_mode else "پست کنسل"), "set:tpcmode")],
+        [B(f"{ON if s.get('opp_cancel_on', True) else OFF} کنسل پندینگ خلاف جهت", "set:opptoggle")],
         [B("‹ بازگشت", "menu:settings")],
     ])
     await show(update, text, kb)
@@ -1037,16 +1066,16 @@ async def _post(ch, text, reply_to=None):
     return m.message_id
 
 
-async def _post_photo(ch, png: bytes, caption: str, reply_to=None):
+async def _post_photo(ch, png: bytes, caption: str, reply_to=None, markup=None):
     rp = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
     m = await BOT.send_photo(chat_id=ch["chat"], photo=png, caption=caption,
-                             parse_mode=ParseMode.HTML, reply_parameters=rp)
+                             parse_mode=ParseMode.HTML, reply_parameters=rp, reply_markup=markup)
     return m.message_id
 
 
 def _final_ev(t) -> str:
     """Image category of a result post: TP, or stop (SL / break-even / manual close in loss)."""
-    if t["outcome"] == "tp" or (t["outcome"] == "manual" and (t.get("result_r") or 0) > 0):
+    if t["outcome"] == "tp" or (t["outcome"] in ("manual", "sl") and (t.get("result_r") or 0) > 0):
         return "tp"
     return "sl"
 
@@ -1068,6 +1097,8 @@ def _badge(t, ev: str, step=None):
         return ("BREAK-EVEN 0R", "#787B86")
     if o == "manual":
         return (f"CLOSED {fmt_r(t['result_r'])}", chart.UP if t["result_r"] > 0 else chart.DOWN)
+    if (t.get("result_r") or 0) > 0.005:  # stop moved into profit
+        return (f"STOP IN PROFIT {fmt_r(t['result_r'])}", chart.UP)
     return (f"STOP LOSS {fmt_r(t['result_r'])}", chart.DOWN)
 
 
@@ -1087,7 +1118,7 @@ async def _send_pic(ch, t, cur):
     """Manual 'Send Pic': chart of the trade right now, as a reply to its post in the channel."""
     s = settings()
     if t["status"] == "open":
-        risk = abs(t["entry"] - t["sl"]) or 1e-12
+        risk = trading.risk_of(t)
         r = (1 if t["side"] == "LONG" else -1) * (cur - t["entry"]) / risk
         badge = (f"IN PROFIT {fmt_r(r)}", chart.UP) if r > 0.005 else (
             (f"IN LOSS {fmt_r(r)}", chart.DOWN) if r < -0.005 else ("AT ENTRY 0R", "#787B86"))
@@ -1102,7 +1133,16 @@ async def _send_pic(ch, t, cur):
                                _start_time(t, ev), badge, s.get("img_labels", False), ahead)
     if not png:
         raise RuntimeError("کندل‌ها دریافت نشد")
-    return await _post_photo(ch, png, caption, reply_to)
+    # glass button back to the position's first post (same as every other stage post)
+    markup = None
+    root = t.get("root_msg_id") or t.get("pending_msg_id") or t.get("open_msg_id")
+    if root:
+        try:
+            base = await _chan_base(ch)
+            markup = M([[InlineKeyboardButton("پست اصلی پوزیشن", url=f"{base}/{root}")]])
+        except Exception:
+            log.exception("send pic back button failed for trade %s", t.get("id"))
+    return await _post_photo(ch, png, caption, reply_to, markup)
 
 
 # ---------- glass link buttons between a position's channel posts ----------
@@ -1135,6 +1175,8 @@ def _post_label(t, ev: str, step=None) -> str:
         return "SL به Entry"
     if ev == "cancel":
         return "کنسل"
+    if ev == "edit":
+        return "ویرایش"
     o = t.get("outcome")
     if o == "tp":
         return "TP"
@@ -1220,23 +1262,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return
     await reset_flow(context.user_data)
-    # Telegram keeps a reply keyboard once it is sent, so the hint that carries it
-    # is sent only the first time for each user (remembered in the database).
-    seen = settings().setdefault("kb_users", [])
-    if u.id not in seen:
-        await say(update, "👇 برای باز کردن منو، دکمه‌ی «منو» را بزن.", main_kb())
-        seen.append(u.id)
-        save()
+    # Always (re)send the ◷ پندینگ / ● پوزیشن / 🏠 منو keyboard: Telegram drops it when the chat is
+    # cleared or on another device, and only a message can bring it back.
+    await say(update, "👇 پندینگ · پوزیشن · منو", main_kb())
     await view_home(update)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Like /start, but always re-sends the keyboard (e.g. after the chat history was cleared)."""
-    u = update.effective_user
-    if u and is_admin(u.id):
-        seen = settings().setdefault("kb_users", [])
-        if u.id in seen:
-            seen.remove(u.id)
     await cmd_start(update, context)
 
 
@@ -1246,6 +1278,344 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return
     await say(update, HELP, home_kb())
+
+
+# ====================== Edit pending / open position (draft from the name button) ======================
+# Tapping «#12 BTC ↑» in the trade list puts a ready draft in the message box:
+#     @bot #12 BTC Int81000 Tp87000 Sl80000      (open position: only Tp / Sl)
+# The admin changes the numbers and sends it; the bot finds what changed by itself.
+# waiting  → edited silently (not in the channel yet)
+# pending  → the original post is rewritten + a reply «Edited · previous mistake» lists the changes
+# open     → a reply says whether the stop got smaller / bigger (or risk-free / in profit) and
+#            whether the target was extended / reduced. 1R stays the original risk.
+
+EDIT_LABEL = {"entry": "Entry", "tp": "TP", "sl": "SL"}
+ACTIVE = ("waiting", "pending", "open")
+
+
+def edit_draft(t) -> str:
+    """Same layout as a new signal (open position: no Int line, Entry is locked):
+    BTC
+    Int84,120.64
+    Tp76,765.22
+    Sl86,838.95"""
+    lines = [t["symbol"]]
+    if t["status"] != "open":
+        lines.append(f"Int{fmt_price(t['entry'])}")
+    lines += [f"Tp{fmt_price(t['tp'])}", f"Sl{fmt_price(t['sl'])}"]
+    return "\n".join(lines)
+
+
+def edit_button(t, label: str, kind: str):
+    """Name button of a trade: sends its template with a 📋 copy button."""
+    return B(label, f"ed:open:{t['id']}:{kind}")
+
+
+_MENTION = re.compile(r"^\s*@(\w+)\s*")
+_EDIT_VAL = re.compile(r"(?<![A-Za-z])(int|entry|ent|en|tp|sl|stop)\s*[:=]?\s*(\d[\d.,'’_]*)", re.I)
+_EDIT_KEY = {"int": "entry", "entry": "entry", "ent": "entry", "en": "entry",
+             "tp": "tp", "sl": "sl", "stop": "sl"}
+PIN_SECONDS = 600  # fallback mode: how long a tapped trade waits for its edited draft
+
+
+def parse_edit(text: str):
+    """(symbol, {field: value}) from «[@bot] BTC Int… Tp… Sl…» (lines or one line), or None."""
+    text = _MENTION.sub("", text.translate(trading._DIGITS).translate(trading._JUNK), count=1)
+    parts = text.split(None, 1)
+    if not parts or _EDIT_VAL.match(parts[0]):
+        return None
+    vals = {}
+    for k, v in _EDIT_VAL.findall(parts[1] if len(parts) > 1 else ""):
+        try:
+            vals[_EDIT_KEY[k.lower()]] = trading._num(v)
+        except ValueError:
+            continue
+    return (parts[0], vals) if vals else None
+
+
+def _is_draft(text: str) -> bool:
+    """Text put in the input box by a name button starts with «@<this bot>»."""
+    m = _MENTION.match(text)
+    if not m:
+        return False
+    me = (getattr(BOT, "username", None) or "").lower() if BOT else ""
+    return not me or m.group(1).lower() == me
+
+
+def _edit_candidates(symbol: str) -> list:
+    pair, base = trading.normalize_pair(symbol)
+    return [t for t in active_trades() if t["pair"] == pair or t["symbol"].upper() == (base or "")]
+
+
+def _best_match(cands, vals):
+    """Several active trades of one symbol: the one whose unchanged values match best."""
+    def score(t):
+        return sum(1 for k, v in vals.items() if abs(v - t[k]) < 1e-9)
+    ranked = sorted(cands, key=score, reverse=True)
+    if len(ranked) == 1 or score(ranked[0]) > score(ranked[1]):
+        return ranked[0]
+    return None
+
+
+def _edit_values(t, new) -> dict:
+    return {k: float(new.get(k, t[k])) for k in ("entry", "tp", "sl")}
+
+
+def _edit_rr(t, v) -> float:
+    risk = trading.risk_of(t) if t["status"] == "open" else (abs(v["entry"] - v["sl"]) or 1e-12)
+    return round(abs(v["tp"] - v["entry"]) / risk, 2)
+
+
+def _edit_check(t, new, cur=None):
+    """Error text, or None if the new values are valid for this trade."""
+    v = _edit_values(t, new)
+    en, tp, sl = v["entry"], v["tp"], v["sl"]
+    long_ = t["side"] == "LONG"
+    if t["status"] == "open":
+        if "entry" in new:
+            return "Entry پوزیشن باز قابل ویرایش نیست؛ فقط TP و SL."
+        if long_ and not tp > en:
+            return "در LONG باید TP بالاتر از Entry باشد."
+        if not long_ and not tp < en:
+            return "در SHORT باید TP پایین‌تر از Entry باشد."
+        if cur is not None:
+            now = fmt_price(cur)
+            if long_ and not sl < cur:
+                return f"در LONG باید SL پایین‌تر از قیمت فعلی ({now}) باشد."
+            if not long_ and not sl > cur:
+                return f"در SHORT باید SL بالاتر از قیمت فعلی ({now}) باشد."
+            if long_ and not tp > cur:
+                return f"در LONG باید TP بالاتر از قیمت فعلی ({now}) باشد."
+            if not long_ and not tp < cur:
+                return f"در SHORT باید TP پایین‌تر از قیمت فعلی ({now}) باشد."
+        return None
+    if long_ and not tp > en > sl:
+        return "ترتیب LONG باید SL < Entry < TP باشد."
+    if not long_ and not tp < en < sl:
+        return "ترتیب SHORT باید TP < Entry < SL باشد."
+    return None
+
+
+async def _root_kb(ch, t):
+    """The link buttons of the root post (so editing its text does not drop them)."""
+    posts = t.get("posts") or []
+    if not posts:
+        return None
+    base = await _chan_base(ch)
+    btns = [InlineKeyboardButton(x["label"], url=f"{base}/{x['id']}") for x in posts]
+    return M([btns[i:i + 3] for i in range(0, len(btns), 3)])
+
+
+async def _edit_root_post(ch, t, cur) -> bool:
+    """Rewrite the pending post with the corrected values (text, or chart + caption)."""
+    mid = t.get("pending_msg_id")
+    if not mid:
+        return False
+    when = None
+    try:
+        raw = t.get("posted_at") or t.get("created_at")
+        when = datetime.fromisoformat(raw).astimezone(TZ) if raw else None
+    except ValueError:
+        pass
+    text = trading.pending_text(t, when)
+    kb = await _root_kb(ch, t)
+    try:
+        await BOT.edit_message_text(chat_id=ch["chat"], message_id=mid, text=text,
+                                    parse_mode=ParseMode.HTML, reply_markup=kb,
+                                    disable_web_page_preview=True)
+        return True
+    except BadRequest as ex:
+        m = str(ex).lower()
+        if "not modified" in m:
+            return True
+        if "no text" not in m:
+            log.warning("edit pending post failed (trade %s): %s", t.get("id"), ex)
+            return False
+    # photo post: redraw the chart with the new levels, else just fix the caption
+    try:
+        s = settings()
+        png = await chart.snapshot(await trading._sess(), t, s.get("img_tf", "15m"), cur, BOT_NAME,
+                                   None, _badge(t, "pending"), s.get("img_labels", False),
+                                   PENDING_AHEAD)
+        if png:
+            await BOT.edit_message_media(
+                chat_id=ch["chat"], message_id=mid, reply_markup=kb,
+                media=InputMediaPhoto(png, caption=text, parse_mode=ParseMode.HTML))
+            return True
+    except Exception:
+        log.exception("edit pending chart failed for trade %s", t.get("id"))
+    try:
+        await BOT.edit_message_caption(chat_id=ch["chat"], message_id=mid, caption=text,
+                                       parse_mode=ParseMode.HTML, reply_markup=kb)
+        return True
+    except BadRequest as ex:
+        return "not modified" in str(ex).lower()
+
+
+async def _apply_edit(ch, t, new, cur) -> str:
+    """Write the new values, then tell the channel. Returns a notice for the admin."""
+    was = t["status"]
+    changes = [[f, t[f], new[f]] for f in ("entry", "tp", "sl") if f in new]
+    old_rr = t["rr"]
+    old_stop = None
+    if was == "open":
+        if not t.get("risk0"):
+            t["risk0"] = abs(t["entry"] - t["sl"])  # positions opened before this update
+        old_stop = trading.stop_r(t)
+        if t.get("be_active") and old_stop < 0:  # BE had moved the stop to Entry
+            old_stop = 0.0
+            for c in changes:
+                if c[0] == "sl":
+                    c[1] = t["entry"]
+        for f, _, n in changes:
+            t[f] = n
+        if "sl" in new:
+            t["be_active"] = trading.stop_r(t) >= -0.005
+    else:
+        for f, _, n in changes:
+            t[f] = n
+        if "entry" in new and cur is not None:
+            t["order"] = trading.order_type(t["side"], t["entry"], cur)
+    t["rr"] = _edit_rr(t, _edit_values(t, {}))
+    t["steps"] = reward_steps(settings()["reward_every"], t["rr"])
+    t.setdefault("edits", []).append({"at": datetime.now(timezone.utc).isoformat(),
+                                      "status": was, "changes": changes})
+    save()
+    what = " · ".join(f"{EDIT_LABEL[f]} {fmt_price(o)} → {fmt_price(n)}" for f, o, n in changes)
+    if was == "waiting":
+        return f"✓ #{t['id']} ویرایش شد ({what}). هنوز در کانال پست نشده بود."
+    try:
+        if was == "pending":
+            fixed = await _edit_root_post(ch, t, cur)
+            mid = await _post(ch, trading.edit_pending_text(t, changes, old_rr), t.get("pending_msg_id"))
+            await _link_post(ch, t, "edit", mid)
+            extra = "" if fixed else "\n⚠️ پست اصلی قابل ویرایش نبود؛ فقط ریپلای اصلاحیه رفت."
+        else:
+            mid = await _post(ch, trading.edit_open_text(t, changes, old_rr, old_stop),
+                              t.get("open_msg_id") or t.get("pending_msg_id"))
+            await _link_post(ch, t, "edit", mid)
+            extra = ""
+    except Exception as ex:
+        log.exception("edit post failed for trade %s", t.get("id"))
+        return f"⚠️ #{t['id']} ذخیره شد ({what}) ولی اعلام در کانال ناموفق بود: <code>{esc(str(ex))}</code>"
+    return f"✓ #{t['id']} ویرایش و در «{esc(ch['title'])}» اعلام شد ({what}).{extra}"
+
+
+
+EDIT_CANCEL = "✖️ لغو ویرایش"
+
+
+def edit_kb() -> ReplyKeyboardMarkup:
+    """While an edit waits for its numbers, the main keyboard is replaced by ✖️ cancel only."""
+    return ReplyKeyboardMarkup([[EDIT_CANCEL]],
+                               resize_keyboard=True, is_persistent=True)
+
+
+async def end_edit(update, ud, text: str):
+    """Leave edit mode and put the normal keyboard back."""
+    ud.pop("edit_pin", None)
+    ud.pop("edit_vals", None)
+    await say(update, text, main_kb())
+
+
+RETRY = "\nدرستش کن و دوباره بفرست، یا «✖️ لغو ویرایش» را بزن."
+
+
+async def try_edit(update, context, text: str) -> bool:
+    """True if the message was an edited template (and was handled)."""
+    ud = context.user_data
+    draft = _is_draft(text)
+    pin = ud.get("edit_pin")
+    if pin and time.time() - pin[1] > PIN_SECONDS:
+        ud.pop("edit_pin", None)
+        pin = None
+    if not draft and not pin:
+        return False
+    parsed = parse_edit(text)
+    if not parsed:
+        await say(update, "❌ قالب را نشناختم. نمونه:\n<pre>BTC\nInt84,120.64\n"
+                          "Tp76,765.22\nSl86,838.95</pre>" + RETRY)
+        return True
+    symbol, vals = parsed
+    cands = _edit_candidates(symbol)
+    if pin:
+        pt = get_trade(pin[0])
+        if pt in cands:
+            cands = [pt]
+        elif not draft:
+            return False  # a new signal for another symbol: not an edit
+    await reset_flow(ud)
+    if not cands:
+        await say(update, f"ℹ️ معامله‌ی فعالی برای <b>{esc(symbol.upper())}</b> پیدا نشد." + RETRY)
+        return True
+    t = _best_match(cands, vals)
+    if t is None:  # same symbol twice and nothing tells them apart: ask
+        ud["edit_vals"] = vals
+        kb = [[B(f"#{c['id']} {c['symbol']} {c['side']} · {c['status'].capitalize()}", f"ed:pick:{c['id']}")]
+              for c in cands]
+        await say(update, "کدام معامله را ویرایش کنم؟", M(kb))
+        return True
+    await handle_edit(update, context, t["id"], vals)
+    return True
+
+
+async def handle_edit(update, context, tid: int, vals: dict):
+    """An edited template came back: work out what changed and apply it right away.
+    On a mistake the edit stays open (fix and resend); on success the normal keyboard returns."""
+    ud = context.user_data
+    t = get_trade(tid)
+    if not t or t["status"] not in ACTIVE:
+        await end_edit(update, ud, f"ℹ️ معامله‌ی #{tid} دیگر فعال نیست.")
+        return
+    kind = "o" if t["status"] == "open" else "p"
+    async with LOCK:
+        ch = get_channel(t["channel"])
+        if not ch or t["status"] not in ACTIVE:
+            await end_edit(update, ud, f"ℹ️ معامله‌ی #{tid} دیگر فعال نیست.")
+            return
+        if t["status"] == "open":  # position: only Tp / Sl, an Int line (old template) is ignored
+            vals = {k: v for k, v in vals.items() if k != "entry"}
+        new = {k: v for k, v in vals.items() if abs(v - t[k]) > 1e-12}
+        if not new:
+            await say(update, "ℹ️ هیچ عددی عوض نشده بود." + RETRY)
+            return
+        cur = await trading.get_price(t["pair"])
+        err = _edit_check(t, new, cur if t["status"] == "open" else None)
+        if err:
+            await say(update, f"❌ {esc(err)}" + RETRY)
+            return
+        notice = await _apply_edit(ch, t, new, cur)
+    await end_edit(update, ud, notice)
+    await view_trades(update, 0, kind)
+
+
+async def on_edit_cb(update, context, p):
+    """Name button: the trade's template with a one-tap copy button.
+    Also «ed:pick:<id>» when an edited draft matched two trades of the same symbol."""
+    ud = context.user_data
+    if len(p) > 2 and p[1] == "pick":
+        vals = ud.pop("edit_vals", None)
+        if not vals:
+            await view_trades(update, 0, "a", "⌛️ منقضی شد؛ دوباره از روی نام معامله ویرایش کن.")
+            return
+        await handle_edit(update, context, int(p[2]), vals)
+        return
+    t = get_trade(int(p[2])) if len(p) > 2 and p[2].isdigit() else None
+    kind = p[3] if len(p) > 3 else "a"
+    if not t or t["status"] not in ACTIVE:
+        await view_trades(update, 0, kind, "ℹ️ این معامله دیگر فعال نیست.")
+        return
+    d = edit_draft(t)
+    ud["edit_pin"] = (t["id"], time.time())  # the next message with this symbol edits this trade
+    only = "  ·  فقط Tp و Sl" if t["status"] == "open" else ""
+    text = f"✏️ <b>#{t['id']} {esc(t['symbol'])}</b>{only}"
+    if CopyTextButton:
+        kb = M([[InlineKeyboardButton("📋 کپی قالب", copy_text=CopyTextButton(text=d))]])
+    else:  # very old python-telegram-bot: show the template to copy by hand
+        kb = None
+        text += f"\n<pre>{esc(d)}</pre>"
+    await say(update, text, kb)
+    await say(update, "کپی کن، عدد را عوض کن و بفرست.", edit_kb())  # ✖️ cancel in the main keyboard
 
 
 # ====================== Input flows ======================
@@ -1316,13 +1686,13 @@ async def handle_state(update, context, st, text):
             if not 1 <= v <= 100:
                 raise ValueError
         except ValueError:
-            await say(update, "❌ یک عدد بین 1 تا 100 بفرست (مثلاً <code>20</code>).",
+            await say(update, "❌ یک عدد بین 1 تا 100 بفرست (مثلاً <code>30</code>).",
                       M([[B("✕ انصراف", "set:pend")]]))
             return
         settings()["near_pct"] = v
         save()
         ud.pop("state")
-        await say(update, f"✓ ارسال نزدیک ورود: <b>{pct(v)}%</b> فاصله‌ی TP",
+        await say(update, f"✓ ارسال نزدیک ورود: <b>{pct(v)}%</b> فاصله‌ی SL تا Entry",
                   M([[B("‹ تنظیمات پندینگ", "set:pend")]]))
     elif st == "set_autotime":
         hhmm = parse_hhmm(text)
@@ -1382,9 +1752,10 @@ def _preview(parsed):
             if now:
                 note = "\n⚡ <b>ارسال فوری</b>: این سیگنال همین الان پست می‌شود (بدون انتظار)."
             else:
-                note = (f"\n⌖ <b>ارسال نزدیک ورود</b>: وقتی قیمت بین "
-                        f"<b>{fmt_price(parsed['entry'] - band)}</b> و <b>{fmt_price(parsed['entry'] + band)}</b> "
-                        f"برسد پست می‌شود ({pct(settings()['near_pct'])}% فاصله‌ی TP).")
+                note = (f"\n⌖ <b>ارسال نزدیک ورود</b>: وقتی قیمت به "
+                        f"<b>{fmt_price(near_trigger(parsed))}</b> برسد پست می‌شود "
+                        f"({pct(settings()['near_pct'])}% فاصله‌ی SL تا Entry · "
+                        f"{fmt_price(band)} تا Entry).")
             kb.append([B(f"{ON if now else OFF} ⚡ ارسال فوری همین پست", "sig:now")])
     kb.append([B("✖️ لغو", "sig:cancel")])
     text = (f"👀 <b>پیش‌نمایش</b>\n\n{trading.pending_text(parsed)}\n\n"
@@ -1399,9 +1770,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_flow(context.user_data)
         await view_home(update)
         return
+    if text == EDIT_CANCEL:  # ✖️ in the main keyboard while an edit is open
+        await reset_flow(context.user_data)
+        await end_edit(update, context.user_data,
+                       "✖️ ویرایش لغو شد." if context.user_data.get("edit_pin") else "ℹ️ ویرایشی در جریان نبود.")
+        return
     if text in (PEND_LABEL, POS_LABEL):  # persistent-keyboard shortcuts
         await reset_flow(context.user_data)
         await view_trades(update, 0, "p" if text == PEND_LABEL else "o")
+        return
+    if await try_edit(update, context, text):  # edited draft from a trade's name button
         return
     st = context.user_data.get("state")
     if st:
@@ -1680,7 +2058,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t["status"] = "waiting"
                 save()
                 await show(update, f"⌖ معامله‌ی <b>#{t['id']}</b> منتظر است؛ وقتی قیمت به "
-                                   f"±{fmt_price(near_band(t))} از Entry رسید در «{esc(ch['title'])}» پست می‌شود.",
+                                   f"<b>{fmt_price(near_trigger(t))}</b> رسید در «{esc(ch['title'])}» پست می‌شود.",
                            M([[B("◷ پندینگ‌ها", "trp:0:p"), B("⬅️ بازگشت", "menu:home")]]))
                 return
             try:
@@ -1693,6 +2071,10 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         await show(update, f"✅ معامله‌ی <b>#{t['id']}</b> در «{esc(ch['title'])}» پست شد و زیر نظر است.",
                    M([[B("◷ پندینگ‌ها", "trp:0:p"), B("⬅️ بازگشت", "menu:home")]]))
+
+    # ---------- edit pending / open position ----------
+    elif a == "ed":
+        await on_edit_cb(update, context, p)
 
     # ---------- trades ----------
     elif a == "tr":
@@ -1733,7 +2115,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if cur is None:
                         await q.message.reply_text("❌ قیمت در دسترس نیست.")
                         return
-                    risk = abs(t["entry"] - t["sl"])
+                    risk = trading.risk_of(t)
                     d = 1 if t["side"] == "LONG" else -1
                     if d * (cur - t["entry"]) / risk <= 0:
                         await q.message.reply_text("قیمت هنوز بالاتر از Entry نیست؛ بریک‌اون ممکن نیست.")
@@ -1745,7 +2127,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if cur is None:
                         await q.message.reply_text("❌ قیمت در دسترس نیست.")
                         return
-                    risk = abs(t["entry"] - t["sl"])
+                    risk = trading.risk_of(t)
                     d = 1 if t["side"] == "LONG" else -1
                     t["result_r"] = round(d * (cur - t["entry"]) / risk, 2)
                     t["outcome"] = "manual"
@@ -1788,6 +2170,11 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save()
             await view_pend(update)
             return
+        if p[1] == "opptoggle":
+            settings()["opp_cancel_on"] = not settings().get("opp_cancel_on", True)
+            save()
+            await view_pend(update)
+            return
         if p[1] == "tpcmode":
             st_ = settings()
             st_["tp_cancel_mode"] = "post" if st_.get("tp_cancel_mode", "delete") == "delete" else "delete"
@@ -1798,9 +2185,9 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud["state"] = "set_near"
             await show(update, "⌖ <b>ارسال نزدیک ورود</b>\n\n"
                                "سیگنال فوراً در کانال پست نمی‌شود؛ بات صبر می‌کند تا قیمت به Entry نزدیک شود.\n"
-                               "فاصله = چند درصد از <b>فاصله‌ی TP تا Entry</b> (ریوارد پوزیشن).\n\n"
-                               "<blockquote>مثال: Entry 86,930 · TP 88,232 → ریوارد 1,302\n"
-                               "20 ← پست وقتی قیمت بین 86,670 و 87,190 برسد</blockquote>\n\n"
+                               "فاصله = چند درصد از <b>فاصله‌ی SL تا Entry</b> (ریسک پوزیشن، 1R).\n\n"
+                               "<blockquote>مثال LONG: Entry 86,930 · SL 86,280 → فاصله 650\n"
+                               "30 ← فاصله 195 ← پست وقتی قیمت به 87,125 برسد</blockquote>\n\n"
                                f"الان: <b>{pct(settings()['near_pct'])}%</b>\n"
                                "یک عدد بین <b>1</b> تا <b>100</b> بفرست.",
                        M([[B("✕ انصراف", "set:pend")]]))
@@ -1890,8 +2277,9 @@ def _tp_reached(t, price) -> bool:
     return price >= t["tp"] if t["side"] == "LONG" else price <= t["tp"]
 
 
-async def _cancel_on_tp(ch, t):
-    """Price hit TP without ever filling Entry: drop the pending (delete post or reply cancel)."""
+async def _cancel_on_tp(ch, t, outcome: str = "tp_cancel"):
+    """Drop a pending that will not be filled (price hit TP first, or the opposite side of
+    the same symbol was activated): delete its post or reply a cancel, per the ⊘ mode."""
     msg = t.get("pending_msg_id")
     if msg:
         deleted = False
@@ -1904,9 +2292,32 @@ async def _cancel_on_tp(ch, t):
             mid = await _post(ch, trading.cancel_text(t), msg)
             await _link_post(ch, t, "cancel", mid)
     t["status"] = "cancelled"
-    t["outcome"] = "tp_cancel"
+    t["outcome"] = outcome
     t["closed_at"] = datetime.now(timezone.utc).isoformat()
     save()
+
+
+async def _cancel_opposite(t):
+    """A position just opened: cancel every waiting / pending signal of the same symbol in the
+    same channel on the OTHER side (Buy activated → pending Sells cancelled, and vice versa)."""
+    if not settings().get("opp_cancel_on", True):
+        return
+    for o in trades():
+        if (o is t or o["status"] not in ("waiting", "pending") or o["pair"] != t["pair"]
+                or o["channel"] != t["channel"] or o["side"] == t["side"]):
+            continue
+        try:
+            if o["status"] == "waiting":  # never posted: just drop it
+                o["status"] = "cancelled"
+                o["outcome"] = "opp_cancel"
+                o["closed_at"] = datetime.now(timezone.utc).isoformat()
+                save()
+            else:
+                ch = get_channel(o["channel"])
+                if ch:
+                    await _cancel_on_tp(ch, o, "opp_cancel")
+        except Exception:
+            log.exception("opposite cancel failed for trade %s", o.get("id"))
 
 
 async def _process(t, cur):
@@ -1944,9 +2355,11 @@ async def _process(t, cur):
                                              t["pending_msg_id"], cur)
         t["status"] = "open"
         t["opened_at"] = datetime.now(timezone.utc).isoformat()
+        t["risk0"] = abs(t["entry"] - t["sl"])  # 1R is fixed from here on (SL may be edited)
         save()
+        await _cancel_opposite(t)  # e.g. Buy activated → pending Sell of this symbol cancelled
 
-    risk = abs(t["entry"] - t["sl"])
+    risk = trading.risk_of(t)
     d = 1 if t["side"] == "LONG" else -1
     r = d * (cur - t["entry"]) / risk
     steps = [s for s in t["steps"] if s < t["rr"]] if settings()["reward_on"] else []
@@ -1971,10 +2384,12 @@ async def _process(t, cur):
             t["be_active"] = True
             await _link_post(ch, t, "be_set", await _post(ch, trading.be_set_text(t), t["open_msg_id"]))
             save()
-        floor = 0.0 if t["be_active"] else -1.0
+        # stop level in R: -1R by default, anywhere if SL was edited; BE lifts it to at least 0R
+        sl_r = trading.stop_r(t)
+        floor = max(sl_r, 0.0) if t["be_active"] else sl_r
         if r <= floor:
-            t["result_r"] = 0.0 if t["be_active"] else -1.0
-            t["outcome"] = "be" if t["be_active"] else "sl"
+            t["result_r"] = round(floor, 2)
+            t["outcome"] = "be" if abs(floor) < 0.005 else "sl"
             await _post_event(ch, t, _final_ev(t), trading.final_text(t), t["open_msg_id"], cur)
             t["status"] = "closed"
             t["closed_at"] = datetime.now(timezone.utc).isoformat()

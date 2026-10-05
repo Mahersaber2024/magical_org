@@ -227,7 +227,8 @@ def _pending_kind(t):
     return emoji, f"Pending {side} {kind.capitalize()}"
 
 
-def pending_text(t):
+def pending_text(t, when: datetime = None):
+    """`when`: keep the original post time when the post is edited later."""
     emoji, label = _pending_kind(t)
     return (
         f"{emoji} <b>{_head(t)}</b>  ·  {label}\n"
@@ -237,7 +238,7 @@ def pending_text(t):
         f"SL   {fmt_price(t['sl'])}\n"
         f"R/R   {fmt_rr(t['rr'])}\n"
         f"{LINE}\n"
-        f"{fa_datetime()}"
+        f"{fa_datetime(when)}"
     )
 
 
@@ -269,6 +270,8 @@ def tp_text(t):
 
 
 def sl_text(t):
+    if (t.get("result_r") or 0) > 0.005:  # stop was moved into profit and got hit
+        return f"Position {t['no']}  ·  Stop in Profit  ·  <b>{fmt_r(t['result_r'])}</b>✅"
     return f"Position {t['no']}  ·  Stop Loss  ·  <b>{fmt_r(t['result_r'])}</b>❌"
 
 
@@ -286,6 +289,60 @@ def manual_text(t):
 
 def final_text(t):
     return {"tp": tp_text, "sl": sl_text, "be": be_text, "manual": manual_text}[t["outcome"]](t)
+
+
+# ---------- edits (✏️ from the trade list) ----------
+
+def risk_of(t) -> float:
+    """1R in price units. Fixed when the position opens (risk0), so moving the stop of an
+    open position later does not change how R is measured."""
+    return float(t.get("risk0") or abs(t["entry"] - t["sl"]) or 1e-12)
+
+
+def stop_r(t, sl=None) -> float:
+    """Where the stop sits, in R (-1R = original stop, 0R = Entry, >0 = profit locked)."""
+    d = 1 if t["side"] == "LONG" else -1
+    return d * ((t["sl"] if sl is None else sl) - t["entry"]) / risk_of(t)
+
+
+_FIELD = {"entry": "Entry", "tp": "TP", "sl": "SL"}
+
+
+def _stop_note(old_r: float, new_r: float) -> str:
+    if abs(new_r) < 0.005:
+        return "Stop at Entry · Risk-free🌱"
+    if new_r > 0:
+        return f"Stop in profit · {fmt_r(new_r)} locked🔒"
+    if new_r > old_r:
+        return f"Smaller stop🔻 · risk {fmt_r(new_r)}"
+    return f"Bigger stop🔺 · risk {fmt_r(new_r)}"
+
+
+def edit_pending_text(t, changes, old_rr):
+    """Reply under a pending post that was corrected. changes = [(field, old, new), ...]"""
+    rows = [f"{_FIELD[f]}   {fmt_price(o)} → <b>{fmt_price(n)}</b>" for f, o, n in changes]
+    if abs(old_rr - t["rr"]) > 0.004:
+        rows.append(f"R/R   {fmt_rr(old_rr)} → <b>{fmt_rr(t['rr'])}</b>")
+    return (f"Position {t['no']}  ·  Edited✏️\n"
+            f"<i>Corrected due to a previous mistake</i>\n"
+            f"{LINE}\n" + "\n".join(rows))
+
+
+def edit_open_text(t, changes, old_rr, old_stop_r):
+    """Reply under an open position whose SL / TP was moved."""
+    rows = []
+    for f, o, n in changes:
+        line = f"{_FIELD[f]}   {fmt_price(o)} → <b>{fmt_price(n)}</b>"
+        if f == "sl":
+            line += f"\n<i>{_stop_note(old_stop_r, stop_r(t))}</i>"
+        elif f == "tp":
+            grew = abs(n - t["entry"]) > abs(o - t["entry"])
+            line += (f"\n<i>{'Target extended🔺' if grew else 'Target reduced🔻'}"
+                     f" · R/R {fmt_rr(old_rr)} → {fmt_rr(t['rr'])}</i>")
+        rows.append(line)
+    title = "SL Updated" if [c[0] for c in changes] == ["sl"] else (
+        "TP Updated" if [c[0] for c in changes] == ["tp"] else "SL / TP Updated")
+    return f"Position {t['no']}  ·  {title}✏️\n{LINE}\n" + "\n".join(rows)
 
 
 HEAVY = "━━━━━━━━━━━━━━"
