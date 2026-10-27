@@ -30,7 +30,7 @@ try:
 except ImportError:  # older library: the copy button is simply left out
     CopyTextButton = None
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -86,12 +86,14 @@ DEFAULTS = {
     "settings": {"reward_on": True, "reward_every": 1, "be_after": 0, "poll_seconds": 5,
                  "auto_on": False, "auto_time": "21:00", "auto_mode": "always",
                  "auto_last_ts": "", "auto_last_date": "",
+                 "backup_on": False, "backup_every_days": 7, "backup_last_ts": "",
                  "img_events": {"pending": False, "entry": False, "reward": False, "tp": False,
                                 "sl": False, "cancel": False},
                  "img_labels": False,
                  "near_on": False, "near_pct": 30, "near_basis": "sl",
                  "tp_cancel_on": False, "tp_cancel_mode": "delete", "opp_cancel_on": True,
-                 "img_tf": "15m"},
+                 "img_tf": "15m",
+                 "owners_extra": [], "see_all": [], "names": {}},
 }
 
 _SCHEMA = """
@@ -324,9 +326,29 @@ def get_trade(tid: int):
     return next((t for t in trades() if t["id"] == tid), None)
 
 
-def active_trades(channel_key: str = None) -> list:
+def mine(t, uid) -> bool:
+    """Does trade `t` belong to admin `uid`? Old trades (saved before owners existed,
+    no "owner" field) belong to the bot owners."""
+    if sees_all(uid):
+        return True
+    o = t.get("owner")
+    return (o == uid) if o is not None else is_owner(uid)
+
+
+def my_trades(uid) -> list:
+    return [t for t in trades() if mine(t, uid)]
+
+
+def _uid(update):
+    u = update.effective_user
+    return u.id if u else None
+
+
+def active_trades(channel_key: str = None, uid=None) -> list:
+    """uid=None -> every admin's trades (price monitor, channel checks); uid=<id> -> only theirs."""
     return [t for t in trades() if t["status"] in ("waiting", "pending", "open")
-            and (channel_key is None or t["channel"] == channel_key)]
+            and (channel_key is None or t["channel"] == channel_key)
+            and (uid is None or mine(t, uid))]
 
 
 def _ref_price(t):
@@ -370,7 +392,7 @@ def reward_steps(every, rr) -> list:
     return out
 
 
-def create_trade(draft: dict, channel: dict) -> dict:
+def create_trade(draft: dict, channel: dict, owner=None) -> dict:
     d = db()
     d["trade_counter"] += 1
     channel["counter"] += 1
@@ -379,6 +401,7 @@ def create_trade(draft: dict, channel: dict) -> dict:
         "id": d["trade_counter"],
         "no": channel["counter"],
         "channel": channel["key"],
+        "owner": owner,
         "status": "pending",
         "steps": reward_steps(s["reward_every"], draft["rr"]),
         "be_after": float(s["be_after"]),
@@ -395,6 +418,8 @@ def create_trade(draft: dict, channel: dict) -> dict:
     }
     for k in ("pair", "symbol", "side", "entry", "tp", "sl", "rr", "order"):
         t[k] = draft[k]
+    t["cancel"] = draft.get("cancel")
+    t["riskfree"] = draft.get("riskfree")
     d["trades"].append(t)
     save()
     return t
@@ -407,12 +432,49 @@ def remove_trade(tid: int):
 
 # ====================== Access control ======================
 
+def owner_ids() -> list:
+    """Fixed owners (.env) first, then admins promoted to owner from the bot."""
+    extra = [i for i in settings().get("owners_extra", []) if i not in ADMIN_IDS]
+    return sorted(ADMIN_IDS) + extra
+
+
 def is_owner(uid: int) -> bool:
-    return uid in ADMIN_IDS
+    return uid in ADMIN_IDS or uid in settings().get("owners_extra", [])
+
+
+def sees_all(uid) -> bool:
+    """Owner who switched on «see & manage everyone's trades»."""
+    return is_owner(uid) and uid in settings().get("see_all", [])
+
+
+def remember_user(u):
+    """Keep name / @username of everyone who uses the bot, so the team list is readable."""
+    if not u:
+        return
+    n = " ".join(x for x in (u.first_name, u.last_name) if x) or ""
+    rec = {"n": n, "u": u.username or ""}
+    names = settings().setdefault("names", {})
+    if names.get(str(u.id)) != rec:
+        names[str(u.id)] = rec
+        save()
+
+
+def who(uid: int) -> str:
+    r = settings().get("names", {}).get(str(uid)) or {}
+    name = esc(r.get("n") or "") or "کاربر"
+    return name + (f"  <i>@{esc(r['u'])}</i>" if r.get("u") else "")
+
+
+def who_name(uid) -> str:
+    """Name only (no @username) of whoever set a trade; '' if unknown / old trade."""
+    if uid is None:
+        return ""
+    r = settings().get("names", {}).get(str(uid)) or {}
+    return esc(r.get("n") or "") or (esc("@" + r["u"]) if r.get("u") else "کاربر")
 
 
 def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS or uid in db()["admins"]
+    return is_owner(uid) or uid in db()["admins"]
 
 
 def admin_only(fn):
@@ -420,6 +482,7 @@ def admin_only(fn):
         u = update.effective_user
         if not u or not is_admin(u.id):
             return
+        remember_user(u)
         return await fn(update, context)
     return wrapper
 
@@ -430,9 +493,9 @@ LOCK = asyncio.Lock()
 esc = html.escape
 
 # <pre> block (monospace, one block). The home screen also has a copy button for all lines.
-SIGNAL_FORMAT = "<pre>BTC\nInt\nTp\nSl</pre>"
-SIGNAL_TEXT = "BTC\nInt\nTp\nSl"  # exactly what the copy button puts on the clipboard
-SIGNAL_EXAMPLE = "<pre>btc\nInt81000\nTp87000\nSl80000</pre>"
+SIGNAL_FORMAT = "<pre>BTC\nInt\nTp\nSl\nCancel\nRiskFree</pre>"
+SIGNAL_TEXT = "BTC\nInt\nTp\nSl\nCancel\nRiskFree"  # exactly what the copy button puts on the clipboard
+SIGNAL_EXAMPLE = "<pre>btc\nInt81000\nTp87000\nSl80000\nCancel84000\nRiskFree83000</pre>"
 
 HELP = (
     "📖 <b>راهنما</b>\n\n"
@@ -442,6 +505,9 @@ HELP = (
     "نمونه:\n"
     f"{SIGNAL_EXAMPLE}\n"
     "• <code>Int</code> = Entry ، <code>Tp</code> = Take Profit ، <code>Sl</code> = Stop Loss\n"
+    "• <code>Cancel</code> اختیاری است (خالی = غیرفعال): اگر پندینگ فعال نشده و قیمت از Cancel رد شود، پندینگ کنسل می‌شود.\n"
+    "• <code>RiskFree</code> اختیاری است (خالی = غیرفعال): وقتی پوزیشن باز است و قیمت به RiskFree برسد، "
+    "SL به Entry منتقل می‌شود (ریسک‌فری) و در کانال اعلام می‌شود. اگر تنظیم شود، جایگزین Break-even بر اساس R است. باید بین Entry و TP باشد.\n"
     "• جهت (LONG/SHORT) و Risk/Reward خودکار محاسبه می‌شود.\n"
     "• پیش‌نمایش می‌آید؛ کانال را انتخاب کن تا خود بات در آن کانال پست بگذارد.\n• بات باید در کانال <b>ادمین</b> با دسترسی «ارسال پست» باشد.\n\n"
     "<b>چرخه‌ی معامله</b>\n"
@@ -450,7 +516,9 @@ HELP = (
     "<b>ویرایش</b>\n"
     "در لیست پندینگ/پوزیشن روی نام معامله (مثلاً <code>#12 BTC ↑</code>) بزن و «📋 کپی قالب» را بزن؛ "
     "عدد را عوض کن و بفرست؛ بات خودش می‌فهمد چه چیزی عوض شده.\n"
-    "پندینگ: Int / Tp / Sl ، پوزیشن باز: فقط Tp / Sl. تغییر در کانال اعلام می‌شود.\n\n"
+    "پندینگ: Int / Tp / Sl / Cancel / RiskFree (Cancel0 / RiskFree0 = حذف) ، "
+    "پوزیشن باز: Tp / Sl / RiskFree (تا وقتی ریسک‌فری نشده). تغییر Entry / TP / SL در کانال اعلام می‌شود؛ "
+    "تغییر Cancel و RiskFree فقط برای ادمین ذخیره می‌شود.\n\n"
     "<b>مدیریت</b>\n"
     "تمام بخش‌ها (کانال‌ها، تنظیمات، گزارش، ادمین) از دکمه‌های زیر در دسترس‌اند.\n"
     "گزارش روزانه‌ی خودکار از «تنظیمات ← گزارش خودکار» قابل تنظیم است."
@@ -491,12 +559,12 @@ def main_kb() -> ReplyKeyboardMarkup:
                                resize_keyboard=True, is_persistent=True)
 
 
-def home_kb():
+def home_kb(uid=None):
     copy_row = ([[InlineKeyboardButton("📋 کپی قالب سیگنال", copy_text=CopyTextButton(text=SIGNAL_TEXT))]]
                 if CopyTextButton else [])
     return M(copy_row + [
         [B("📈 عملکرد", "menu:stats"), B("📺 کانال‌ها", "menu:channels")],
-        [B("⚙️ تنظیمات", "menu:settings"), B("🛡 پنل ادمین", "adm:home")],
+        [B("⚙️ تنظیمات", "menu:settings")] + ([B("🛡 پنل ادمین", "adm:home")] if uid is not None and is_owner(uid) else []),
         [B("❓ راهنما", "menu:help")],
     ])
 
@@ -522,8 +590,8 @@ def uptime_str(sec: float) -> str:
     return " ".join(parts[:3])
 
 
-def _counts():
-    tr = trades()
+def _counts(uid=None):
+    tr = trades() if uid is None else my_trades(uid)
     pend = sum(1 for t in tr if t["status"] in ("waiting", "pending"))
     opn = sum(1 for t in tr if t["status"] == "open")
     unrep = sum(1 for t in tr if t["status"] == "closed" and not t["reported"])
@@ -541,7 +609,7 @@ async def reset_flow(ud: dict):
 # ====================== Views ======================
 
 async def view_home(update):
-    pend, opn, unrep = _counts()
+    pend, opn, unrep = _counts(_uid(update))
     text = (
         f"<b>{BOT_NAME}</b> · پنل مدیریت\n\n"
         "<blockquote>"
@@ -550,7 +618,7 @@ async def view_home(update):
         f"📺 کانال‌ها: <b>{len(channels())}</b>"
         "</blockquote>"
     )
-    await show(update, text, home_kb())
+    await show(update, text, home_kb(_uid(update)))
 
 
 async def view_help(update):
@@ -582,7 +650,7 @@ TRADE_VIEWS = {
 async def view_trades(update, page: int = 0, kind: str = "a", notice: str = ""):
     kind = kind if kind in TRADE_VIEWS else "a"
     title, empty_msg, statuses = TRADE_VIEWS[kind]
-    active = [t for t in active_trades() if t["status"] in statuses]
+    active = [t for t in active_trades(uid=_uid(update)) if t["status"] in statuses]
     if not active:
         await show(update, f"<b>{title}</b>\n\n{empty_msg}",
                    M([[B("بروزرسانی", f"trp:0:{kind}")]]))
@@ -615,11 +683,17 @@ async def view_trades(update, page: int = 0, kind: str = "a", notice: str = ""):
         if is_open and r is not None:
             status += f"  ·  <b>{fmt_r(r)}</b>"
         chn = get_channel(t["channel"])
+        setter = who_name(t.get("owner"))
+        chn_name = esc(chn['title']) if chn else '—'
         head = (f"<b>#{t['id']}  {esc(t['symbol'])} {t['side']}</b>  ·  {status}"
-                f"  |  {esc(chn['title']) if chn else '—'}")
+                f"  |  {setter + ' → ' if setter else ''}{chn_name}")
 
         # body
         body = [f"Entry {fmt_price(t['entry'])}   TP {fmt_price(t['tp'])}   SL {fmt_price(t['sl'])}"]
+        if not is_open and t.get("cancel") is not None:
+            body[0] += f"   Cancel {fmt_price(t['cancel'])}"
+        if t.get("riskfree") is not None and not t.get("be_active"):
+            body[0] += f"   RF {fmt_price(t['riskfree'])}"
         extra = []
         if t["rewards_hit"]:
             extra.append("Rewards " + " ".join(fmt_step(s) for s in sorted(t["rewards_hit"])))
@@ -662,16 +736,16 @@ async def view_trades(update, page: int = 0, kind: str = "a", notice: str = ""):
     await show(update, text, M(kb))
 
 
-def _unreported(key: str) -> list:
-    return [t for t in trades()
+def _unreported(key: str, uid=None) -> list:
+    return [t for t in (trades() if uid is None else my_trades(uid))
             if t["channel"] == key and t["status"] == "closed" and not t["reported"]]
 
 
-def _report_kb() -> list:
+def _report_kb(uid=None) -> list:
     """One-tap report buttons: one per channel with unreported closed trades (+ all)."""
     rows, total = [], 0
     for c in channels():
-        n = len(_unreported(c["key"]))
+        n = len(_unreported(c["key"], uid))
         if n:
             total += n
             rows.append([B(f"📤 ارسال گزارش · {c['title']} ({n})", f"sum:go:{c['key']}")])
@@ -681,9 +755,10 @@ def _report_kb() -> list:
 
 
 async def view_stats(update, notice: str = ""):
-    closed = [t for t in trades() if t["status"] == "closed" and t["result_r"] is not None]
+    uid = _uid(update)
+    closed = [t for t in my_trades(uid) if t["status"] == "closed" and t["result_r"] is not None]
     if not closed:
-        pend, opn, _ = _counts()
+        pend, opn, _ = _counts(uid)
         await show(update,
                    "📈 <b>عملکرد</b>\n\n"
                    "هنوز نتیجه‌ای برای نمایش نیست.\n"
@@ -711,7 +786,7 @@ async def view_stats(update, notice: str = ""):
             per_ch.append(f"• {esc(c['title'])}: {len(rows)} معامله · <b>{fmt_r(sum(rows))}</b>")
     if per_ch:
         lines += ["", "📺 <b>به تفکیک کانال</b>", "<blockquote>" + "\n".join(per_ch) + "</blockquote>"]
-    rep_rows = _report_kb()
+    rep_rows = _report_kb(uid)
     if not rep_rows:
         lines += ["", "📤 همه‌ی معاملات بسته‌شده گزارش شده‌اند."]
     if notice:
@@ -750,6 +825,8 @@ async def view_settings(update):
          B("◇ فاصله‌ی ریوارد", "set:rewards")],
         [B("⇅ Break-even", "set:be"), B("◷ گزارش خودکار", "menu:auto")],
         [B("◷ تنظیمات پندینگ", "set:pend"), B("▣ عکس پست‌ها", "set:img")],
+    ] + ([[B(f"👁 دیدن و مدیریت معاملات همه: {'روشن ✓' if sees_all(update.effective_user.id) else 'خاموش ✗'}",
+             "set:seeall")]] if is_owner(update.effective_user.id) else []) + [
         [B("‹ بازگشت", "menu:home")],
     ])
     await show(update, text, kb)
@@ -861,7 +938,7 @@ async def view_admin(update):
         "<blockquote>"
         f"◉ نقش  ·  <b>{'مالک' if owner else 'ادمین'}</b>\n"
         f"# آیدی  ·  <code>{uid}</code>\n"
-        f"◎ مالکان  ·  <b>{len(ADMIN_IDS)}</b>     ◌ ادمین‌ها  ·  <b>{len(db()['admins'])}</b>"
+        f"◎ مالکان  ·  <b>{len(owner_ids())}</b>     ◌ ادمین‌ها  ·  <b>{len([a for a in db()['admins'] if not is_owner(a)])}</b>"
         "</blockquote>"
     )
     if owner:
@@ -880,16 +957,27 @@ def _safety_copies() -> int:
 
 
 async def view_backup(update):
+    s = settings()
+    if s.get("backup_on"):
+        last = s.get("backup_last_ts") or "هنوز اجرا نشده"
+        backup_status = f"روشن · هر {s.get('backup_every_days', 7)} روز · آخرین ارسال: {last}"
+    else:
+        backup_status = "خاموش"
     text = (
         "▦ <b>بکاپ و ریستور</b>\n\n"
         "<blockquote>"
         f"▤ حجم دیتابیس  ·  <b>{_db_size()}</b>\n"
-        f"◷ نسخه‌های قبل از ریستور  ·  <b>{_safety_copies()}</b>"
+        f"◷ نسخه‌های قبل از ریستور  ·  <b>{_safety_copies()}</b>\n"
+        f"⟳ بکاپ خودکار  ·  <b>{backup_status}</b>"
         "</blockquote>\n\n"
         "⇩ <b>گرفتن بکاپ</b>: یک فایل <code>.db</code> از کانال‌ها، معاملات، تاریخچه و تنظیمات.\n"
-        "⇧ <b>ریستور</b>: همان فایل را برگردان؛ قبلش از دیتای فعلی خودکار نسخه گرفته می‌شود."
+        "⇧ <b>ریستور</b>: همان فایل را برگردان؛ قبلش از دیتای فعلی خودکار نسخه گرفته می‌شود.\n"
+        "⟳ بکاپ خودکار برای مالکان، داخل گفت‌وگوی خصوصی بات ارسال می‌شود."
     )
-    kb = M([[B("⇩ گرفتن بکاپ", "adm:backup"), B("⇧ ریستور بکاپ", "adm:restore")],
+    kb = M([
+            [B("⇩ گرفتن بکاپ", "adm:backup"), B("⇧ ریستور بکاپ", "adm:restore")],
+            [B(("🔕 خاموش کردن" if s.get("backup_on") else "🔔 روشن کردن"), "adm:autobackup"),
+             B(f"⟳ فاصله: هر {s.get('backup_every_days', 7)} روز", "adm:backupdays")],
             [B("‹ پنل ادمین", "adm:home")]])
     await show(update, text, kb)
 
@@ -897,23 +985,69 @@ async def view_backup(update):
 async def view_admins(update):
     uid = update.effective_user.id
     owner = is_owner(uid)
-    lines = ["👥 <b>ادمین‌ها</b>\n", "👑 <b>مالکان</b> (فایل .env)"]
-    for i in sorted(ADMIN_IDS):
-        lines.append(f"• <code>{i}</code>" + ("  ← شما" if i == uid else ""))
-    extra = db()["admins"]
-    lines += ["", "🛡 <b>ادمین‌ها</b>"]
-    kb = []
-    if extra:
-        for i in extra:
-            lines.append(f"• <code>{i}</code>" + ("  ← شما" if i == uid else ""))
-            if owner:
-                kb.append([B(f"🗑 حذف {i}", f"adm:del:{i}")])
+    owners = owner_ids()
+    plain = [i for i in db()["admins"] if not is_owner(i)]
+    me = "  ◂ شما"
+
+    def row(i, last):
+        return f"{'┗' if last else '┣'} {who(i)}" + (me if i == uid else "") + f"\n{'   ' if last else '┃ '} <code>{i}</code>"
+
+    lines = ["👥 <b>تیم</b>", ""]
+    lines.append(f"👑 <b>مالکان</b>  ·  {len(owners)}")
+    lines.append("<blockquote>" + "\n".join(
+        row(i, k == len(owners) - 1) + ("  🔒" if i in ADMIN_IDS else "")
+        for k, i in enumerate(owners)) + "</blockquote>")
+    lines.append(f"🛡 <b>ادمین‌ها</b>  ·  {len(plain)}")
+    if plain:
+        lines.append("<blockquote>" + "\n".join(
+            row(i, k == len(plain) - 1) for k, i in enumerate(plain)) + "</blockquote>")
     else:
-        lines.append("ادمین اضافه‌ای وجود ندارد.")
+        lines.append("<blockquote>هنوز ادمینی اضافه نشده.</blockquote>")
+    lines.append("<i>🔒 = مالک اصلی (در فایل .env)، از داخل بات قابل تغییر نیست.</i>")
+    kb = []
     if owner:
+        lines.append("<i>برای تغییر نقش یا حذف، روی اسم هر نفر بزن.</i>")
+        people = [(i, "👑") for i in owners] + [(i, "🛡") for i in plain]
+        btns = [B(f"{ic} {_plain_name(i)}", f"adm:u:{i}") for i, ic in people]
+        kb += [btns[k:k + 2] for k in range(0, len(btns), 2)]
         kb.append([B("➕ افزودن ادمین", "adm:add")])
-    kb.append([B("⬅️ بازگشت", "adm:home")])
+        on = uid in settings().get("see_all", [])
+        kb.append([B(f"👁 دیدن و مدیریت معاملات همه:  {'روشن ✓' if on else 'خاموش ✗'}", "set:seeall:a")])
+    kb.append([B("‹ بازگشت", "adm:home")])
     await show(update, "\n".join(lines), M(kb))
+
+
+def _plain_name(i: int) -> str:
+    r = settings().get("names", {}).get(str(i)) or {}
+    return (r.get("n") or (f"@{r['u']}" if r.get("u") else "") or str(i))[:22]
+
+
+async def view_admin_user(update, aid: int, notice: str = ""):
+    uid = update.effective_user.id
+    if not is_admin(aid):
+        await view_admins(update)
+        return
+    fixed = aid in ADMIN_IDS
+    owner = is_owner(aid)
+    n_act = len([t for t in active_trades() if t.get("owner") == aid])
+    text = (f"{'👑' if owner else '🛡'} <b>{who(aid)}</b>\n\n<blockquote>"
+            f"# آیدی  ·  <code>{aid}</code>\n"
+            f"◉ نقش  ·  <b>{'مالک' if owner else 'ادمین'}</b>{' (اصلی 🔒)' if fixed else ''}\n"
+            f"📋 معاملات فعال  ·  <b>{n_act}</b></blockquote>")
+    if notice:
+        text = notice + "\n\n" + text
+    kb = []
+    if aid == uid:
+        text += "\n\n<i>این خودِ شماست؛ نقش خودتان را از اینجا نمی‌توانید عوض کنید.</i>"
+    elif fixed:
+        text += "\n\n<i>مالک اصلی در فایل .env تعریف شده و از داخل بات قابل تغییر نیست.</i>"
+    elif owner:
+        kb.append([B("⬇️ تبدیل به ادمین (آنمالک)", f"adm:demo:{aid}")])
+    else:
+        kb.append([B("👑 ارتقا به مالک", f"adm:promo:{aid}")])
+        kb.append([B("🗑 حذف از ادمین‌ها", f"adm:del:{aid}")])
+    kb.append([B("‹ تیم", "adm:list")])
+    await show(update, text, M(kb))
 
 
 def _db_size() -> str:
@@ -971,6 +1105,50 @@ def _reschedule_auto(job_queue):
         return
     h, m = _auto_hm()
     job_queue.run_daily(auto_report, time=dtime(h, m, tzinfo=TZ), name="autoreport")
+
+
+def _reschedule_backup(job_queue):
+    for j in job_queue.get_jobs_by_name("autobackup"):
+        j.schedule_removal()
+    if settings().get("backup_on"):
+        job_queue.run_repeating(auto_backup, interval=86400, first=20, name="autobackup")
+
+
+async def auto_backup(context: ContextTypes.DEFAULT_TYPE):
+    s = settings()
+    if not s.get("backup_on"):
+        return
+    last = s.get("backup_last_ts")
+    if last:
+        try:
+            elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last)
+            if elapsed < timedelta(days=int(s.get("backup_every_days", 7))):
+                return
+        except (TypeError, ValueError):
+            pass
+    owners = owner_ids()
+    tmp = None
+    sent = 0
+    try:
+        tmp = make_backup()
+        payload = tmp.read_bytes()
+        name = f"magical_org_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
+        for owner in owners:
+            try:
+                await context.bot.send_document(
+                    chat_id=owner, document=payload, filename=name,
+                    caption=BACKUP_CAPTION, parse_mode=ParseMode.HTML)
+                sent += 1
+            except Exception:
+                log.exception("automatic backup failed for owner %s", owner)
+        if sent == len(owners) and sent:
+            s["backup_last_ts"] = datetime.now(timezone.utc).isoformat()
+            save()
+    except Exception:
+        log.exception("automatic backup creation failed")
+    finally:
+        if tmp:
+            tmp.unlink(missing_ok=True)
 
 
 def _catchup_auto(job_queue):
@@ -1069,7 +1247,8 @@ async def _post(ch, text, reply_to=None):
 async def _post_photo(ch, png: bytes, caption: str, reply_to=None, markup=None):
     rp = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
     m = await BOT.send_photo(chat_id=ch["chat"], photo=png, caption=caption,
-                             parse_mode=ParseMode.HTML, reply_parameters=rp, reply_markup=markup)
+                             parse_mode=ParseMode.HTML, reply_parameters=rp, reply_markup=markup,
+                             read_timeout=60, write_timeout=60, connect_timeout=20, pool_timeout=20)
     return m.message_id
 
 
@@ -1230,18 +1409,28 @@ async def _post_event(ch, t, ev: str, text: str, reply_to=None, price=None, step
 
 async def _post_event_raw(ch, t, ev: str, text: str, reply_to=None, price=None, step=None):
     """Channel post for a trade stage. If that stage is ticked in ▣ عکس پست‌ها, it is sent
-    as a chart photo with the text as caption; on any chart error it falls back to text."""
+    as a chart photo with the text as caption. Text fallback happens ONLY if the photo was
+    certainly not delivered (chart error / Telegram rejected it). On a timeout / network error
+    the photo may already be in the channel, so we never send the text again (no duplicates)."""
     s = settings()
     if s["img_events"].get(ev):
+        png = None
         try:
             png = await chart.snapshot(await trading._sess(), t, s.get("img_tf", "15m"), price,
                                        BOT_NAME, _start_time(t, ev), _badge(t, ev, step),
                                        s.get("img_labels", False),
                                        PENDING_AHEAD if ev == "pending" else 0)
-            if png:
-                return await _post_photo(ch, png, text, reply_to)
         except Exception:
-            log.exception("%s image failed for trade %s, sending text", ev, t.get("id"))
+            log.exception("%s chart failed for trade %s, sending text", ev, t.get("id"))
+        if png:
+            try:
+                return await _post_photo(ch, png, text, reply_to)
+            except (TimedOut, NetworkError):
+                log.exception("%s photo send uncertain for trade %s (maybe delivered); "
+                              "NOT sending text to avoid a duplicate", ev, t.get("id"))
+                return None
+            except Exception:
+                log.exception("%s photo rejected for trade %s, sending text", ev, t.get("id"))
     return await _post(ch, text, reply_to)
 
 
@@ -1261,6 +1450,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or not is_admin(u.id):
         await _deny(update)
         return
+    remember_user(u)
     await reset_flow(context.user_data)
     # Always (re)send the ◷ پندینگ / ● پوزیشن / 🏠 منو keyboard: Telegram drops it when the chat is
     # cleared or on another device, and only a message can bring it back.
@@ -1277,7 +1467,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or not is_admin(u.id):
         await _deny(update)
         return
-    await say(update, HELP, home_kb())
+    await say(update, HELP, home_kb(u.id))
 
 
 # ====================== Edit pending / open position (draft from the name button) ======================
@@ -1285,12 +1475,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     @bot #12 BTC Int81000 Tp87000 Sl80000      (open position: only Tp / Sl)
 # The admin changes the numbers and sends it; the bot finds what changed by itself.
 # waiting  → edited silently (not in the channel yet)
-# pending  → the original post is rewritten + a reply «Edited · previous mistake» lists the changes
+    # pending  → Entry / TP / SL rewrite the original post + a reply lists the changes
 # open     → a reply says whether the stop got smaller / bigger (or risk-free / in profit) and
 #            whether the target was extended / reduced. 1R stays the original risk.
 
-EDIT_LABEL = {"entry": "Entry", "tp": "TP", "sl": "SL"}
+EDIT_LABEL = {"entry": "Entry", "tp": "TP", "sl": "SL", "cancel": "Cancel", "riskfree": "RiskFree"}
 ACTIVE = ("waiting", "pending", "open")
+NOTIFY_FIELDS = ("entry", "tp", "sl")  # only these edits touch or announce channel posts
 
 
 def edit_draft(t) -> str:
@@ -1303,6 +1494,10 @@ def edit_draft(t) -> str:
     if t["status"] != "open":
         lines.append(f"Int{fmt_price(t['entry'])}")
     lines += [f"Tp{fmt_price(t['tp'])}", f"Sl{fmt_price(t['sl'])}"]
+    if t["status"] != "open":
+        lines.append(f"Cancel{fmt_price(t['cancel'])}" if t.get("cancel") is not None else "Cancel")
+    if not t.get("be_active"):  # once risk-free, the level has done its job
+        lines.append(f"RiskFree{fmt_price(t['riskfree'])}" if t.get("riskfree") is not None else "RiskFree")
     return "\n".join(lines)
 
 
@@ -1312,9 +1507,11 @@ def edit_button(t, label: str, kind: str):
 
 
 _MENTION = re.compile(r"^\s*@(\w+)\s*")
-_EDIT_VAL = re.compile(r"(?<![A-Za-z])(int|entry|ent|en|tp|sl|stop)\s*[:=]?\s*(\d[\d.,'’_]*)", re.I)
+_EDIT_VAL = re.compile(r"(?<![A-Za-z])(risk\s*-?\s*free|rf|int|entry|ent|en|tp|sl|stop|cancel|cnl|cn)"
+                       r"\s*[:=]?\s*(\d[\d.,'’_]*)", re.I)
 _EDIT_KEY = {"int": "entry", "entry": "entry", "ent": "entry", "en": "entry",
-             "tp": "tp", "sl": "sl", "stop": "sl"}
+             "tp": "tp", "sl": "sl", "stop": "sl", "cancel": "cancel", "cnl": "cancel", "cn": "cancel",
+             "riskfree": "riskfree", "rf": "riskfree"}
 PIN_SECONDS = 600  # fallback mode: how long a tapped trade waits for its edited draft
 
 
@@ -1327,7 +1524,7 @@ def parse_edit(text: str):
     vals = {}
     for k, v in _EDIT_VAL.findall(parts[1] if len(parts) > 1 else ""):
         try:
-            vals[_EDIT_KEY[k.lower()]] = trading._num(v)
+            vals[_EDIT_KEY[re.sub(r"[\s-]", "", k.lower())]] = trading._num(v)
         except ValueError:
             continue
     return (parts[0], vals) if vals else None
@@ -1342,15 +1539,15 @@ def _is_draft(text: str) -> bool:
     return not me or m.group(1).lower() == me
 
 
-def _edit_candidates(symbol: str) -> list:
+def _edit_candidates(symbol: str, uid=None) -> list:
     pair, base = trading.normalize_pair(symbol)
-    return [t for t in active_trades() if t["pair"] == pair or t["symbol"].upper() == (base or "")]
+    return [t for t in active_trades(uid=uid) if t["pair"] == pair or t["symbol"].upper() == (base or "")]
 
 
 def _best_match(cands, vals):
     """Several active trades of one symbol: the one whose unchanged values match best."""
     def score(t):
-        return sum(1 for k, v in vals.items() if abs(v - t[k]) < 1e-9)
+        return sum(1 for k, v in vals.items() if abs(v - (t.get(k) or 0)) < 1e-9)
     ranked = sorted(cands, key=score, reverse=True)
     if len(ranked) == 1 or score(ranked[0]) > score(ranked[1]):
         return ranked[0]
@@ -1368,6 +1565,22 @@ def _edit_rr(t, v) -> float:
 
 def _edit_check(t, new, cur=None):
     """Error text, or None if the new values are valid for this trade."""
+    err = _edit_check_levels(t, new, cur)
+    if err:
+        return err
+    v = _edit_values(t, new)
+    rf = new["riskfree"] if "riskfree" in new else t.get("riskfree")
+    if rf and not t.get("be_active") and ("riskfree" in new or "tp" in new or "entry" in new):
+        if err := trading.riskfree_check(t["side"], v["entry"], v["tp"], rf):
+            return err
+        if "riskfree" in new and t["status"] == "open" and cur is not None and \
+                trading.riskfree_reached({**t, "riskfree": rf}, cur):
+            return (f"قیمت فعلی ({fmt_price(cur)}) از این RiskFree رد شده؛ "
+                    f"برای ریسک‌فری کردن فوری دکمه‌ی Break-even را بزن.")
+    return None
+
+
+def _edit_check_levels(t, new, cur=None):
     v = _edit_values(t, new)
     en, tp, sl = v["entry"], v["tp"], v["sl"]
     long_ = t["side"] == "LONG"
@@ -1393,6 +1606,12 @@ def _edit_check(t, new, cur=None):
         return "ترتیب LONG باید SL < Entry < TP باشد."
     if not long_ and not tp < en < sl:
         return "ترتیب SHORT باید TP < Entry < SL باشد."
+    if "entry" in new or "cancel" in new:
+        c = new["cancel"] if "cancel" in new else t.get("cancel")
+        if c:  # 0 / None = no Cancel level
+            if cur is None:
+                return "قیمت لحظه‌ای پیدا نشد؛ Cancel قابل بررسی نیست. دوباره امتحان کن."
+            return trading.cancel_check(en, c, cur)
     return None
 
 
@@ -1455,7 +1674,11 @@ async def _edit_root_post(ch, t, cur) -> bool:
 async def _apply_edit(ch, t, new, cur) -> str:
     """Write the new values, then tell the channel. Returns a notice for the admin."""
     was = t["status"]
-    changes = [[f, t[f], new[f]] for f in ("entry", "tp", "sl") if f in new]
+    if "cancel" in new and not new["cancel"]:
+        new = {**new, "cancel": None}  # Cancel0 = remove the Cancel level
+    if "riskfree" in new and not new["riskfree"]:
+        new = {**new, "riskfree": None}  # RiskFree0 = remove the RiskFree level
+    changes = [[f, t.get(f), new[f]] for f in ("entry", "tp", "sl", "cancel", "riskfree") if f in new]
     old_rr = t["rr"]
     old_stop = None
     if was == "open":
@@ -1481,20 +1704,27 @@ async def _apply_edit(ch, t, new, cur) -> str:
     t.setdefault("edits", []).append({"at": datetime.now(timezone.utc).isoformat(),
                                       "status": was, "changes": changes})
     save()
-    what = " · ".join(f"{EDIT_LABEL[f]} {fmt_price(o)} → {fmt_price(n)}" for f, o, n in changes)
+    what = " · ".join(f"{EDIT_LABEL[f]} {trading._fp(o)} → {trading._fp(n)}" for f, o, n in changes)
     if was == "waiting":
         return f"✓ #{t['id']} ویرایش شد ({what}). هنوز در کانال پست نشده بود."
+    # Only Entry / TP / SL changes are announced in the channel.
+    # Cancel / RiskFree edits are saved silently.
+    notify = [c for c in changes if c[0] in NOTIFY_FIELDS]
     try:
+        extra = ""
         if was == "pending":
-            fixed = await _edit_root_post(ch, t, cur)
-            mid = await _post(ch, trading.edit_pending_text(t, changes, old_rr), t.get("pending_msg_id"))
-            await _link_post(ch, t, "edit", mid)
-            extra = "" if fixed else "\n⚠️ پست اصلی قابل ویرایش نبود؛ فقط ریپلای اصلاحیه رفت."
-        else:
-            mid = await _post(ch, trading.edit_open_text(t, changes, old_rr, old_stop),
+            if notify:
+                fixed = await _edit_root_post(ch, t, cur)
+                mid = await _post(ch, trading.edit_pending_text(t, notify, old_rr), t.get("pending_msg_id"))
+                await _link_post(ch, t, "edit", mid)
+                if not fixed:
+                    extra = "\n⚠️ پست اصلی قابل ویرایش نبود؛ فقط ریپلای اصلاحیه رفت."
+        elif notify:
+            mid = await _post(ch, trading.edit_open_text(t, notify, old_rr, old_stop),
                               t.get("open_msg_id") or t.get("pending_msg_id"))
             await _link_post(ch, t, "edit", mid)
-            extra = ""
+        if not notify:
+            return f"✓ #{t['id']} ویرایش شد ({what}). در کانال اعلام نشد (فقط Entry / TP / SL اعلام می‌شوند)."
     except Exception as ex:
         log.exception("edit post failed for trade %s", t.get("id"))
         return f"⚠️ #{t['id']} ذخیره شد ({what}) ولی اعلام در کانال ناموفق بود: <code>{esc(str(ex))}</code>"
@@ -1537,7 +1767,7 @@ async def try_edit(update, context, text: str) -> bool:
                           "Tp76,765.22\nSl86,838.95</pre>" + RETRY)
         return True
     symbol, vals = parsed
-    cands = _edit_candidates(symbol)
+    cands = _edit_candidates(symbol, _uid(update))
     if pin:
         pt = get_trade(pin[0])
         if pt in cands:
@@ -1564,7 +1794,7 @@ async def handle_edit(update, context, tid: int, vals: dict):
     On a mistake the edit stays open (fix and resend); on success the normal keyboard returns."""
     ud = context.user_data
     t = get_trade(tid)
-    if not t or t["status"] not in ACTIVE:
+    if not t or t["status"] not in ACTIVE or not mine(t, _uid(update)):
         await end_edit(update, ud, f"ℹ️ معامله‌ی #{tid} دیگر فعال نیست.")
         return
     kind = "o" if t["status"] == "open" else "p"
@@ -1573,14 +1803,16 @@ async def handle_edit(update, context, tid: int, vals: dict):
         if not ch or t["status"] not in ACTIVE:
             await end_edit(update, ud, f"ℹ️ معامله‌ی #{tid} دیگر فعال نیست.")
             return
-        if t["status"] == "open":  # position: only Tp / Sl, an Int line (old template) is ignored
-            vals = {k: v for k, v in vals.items() if k != "entry"}
-        new = {k: v for k, v in vals.items() if abs(v - t[k]) > 1e-12}
+        if t["status"] == "open":  # position: only Tp / Sl / RiskFree, Int / Cancel lines are ignored
+            vals = {k: v for k, v in vals.items() if k not in ("entry", "cancel")}
+        if t.get("be_active"):  # already risk-free: the RiskFree line has nothing left to do
+            vals.pop("riskfree", None)
+        new = {k: v for k, v in vals.items() if abs(v - (t.get(k) or 0)) > 1e-12}
         if not new:
             await say(update, "ℹ️ هیچ عددی عوض نشده بود." + RETRY)
             return
         cur = await trading.get_price(t["pair"])
-        err = _edit_check(t, new, cur if t["status"] == "open" else None)
+        err = _edit_check(t, new, cur)
         if err:
             await say(update, f"❌ {esc(err)}" + RETRY)
             return
@@ -1602,12 +1834,12 @@ async def on_edit_cb(update, context, p):
         return
     t = get_trade(int(p[2])) if len(p) > 2 and p[2].isdigit() else None
     kind = p[3] if len(p) > 3 else "a"
-    if not t or t["status"] not in ACTIVE:
+    if not t or t["status"] not in ACTIVE or not mine(t, _uid(update)):
         await view_trades(update, 0, kind, "ℹ️ این معامله دیگر فعال نیست.")
         return
     d = edit_draft(t)
     ud["edit_pin"] = (t["id"], time.time())  # the next message with this symbol edits this trade
-    only = "  ·  فقط Tp و Sl" if t["status"] == "open" else ""
+    only = ("  ·  فقط Tp و Sl" + ("" if t.get("be_active") else " و RiskFree")) if t["status"] == "open" else ""
     text = f"✏️ <b>#{t['id']} {esc(t['symbol'])}</b>{only}"
     if CopyTextButton:
         kb = M([[InlineKeyboardButton("📋 کپی قالب", copy_text=CopyTextButton(text=d))]])
@@ -1645,14 +1877,14 @@ async def handle_state(update, context, st, text):
             await say(update, "❌ آیدی عددی تلگرام را بفرست (مثلاً <code>123456789</code>).", cancel_kb())
             return
         uid = int(text)
-        if uid in ADMIN_IDS or uid in db()["admins"]:
+        if is_admin(uid):
             await say(update, "ℹ️ این کاربر از قبل ادمین است.", cancel_kb())
             return
         db()["admins"].append(uid)
         save()
         ud.pop("state", None)
         await say(update, f"✅ کاربر <code>{uid}</code> به ادمین‌ها اضافه شد.",
-                  M([[B("⬅️ بازگشت", "adm:list")]]))
+                  M([[B("👑 ارتقا به مالک", f"adm:promo:{uid}")], [B("⬅️ بازگشت", "adm:list")]]))
     elif st == "set_rewards":
         try:
             v = float(text.translate(trading._DIGITS).replace(",", "."))
@@ -1715,6 +1947,18 @@ async def handle_state(update, context, st, text):
         _reschedule(context.job_queue)
         await say(update, f"✓ چک قیمت روی <b>هر {text} ثانیه</b> تنظیم شد.",
                   M([[B("‹ پنل ادمین", "adm:home")]]))
+    elif st == "set_backup_days":
+        raw = text.translate(trading._DIGITS).strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= 90:
+            await say(update, "❌ عددی بین 1 تا 90 بفرست.", M([[B("✕ انصراف", "adm:bk")]]))
+            return
+        days = int(raw)
+        settings()["backup_every_days"] = days
+        save()
+        ud.pop("state", None)
+        _reschedule_backup(context.job_queue)
+        await say(update, f"✅ بکاپ خودکار روی <b>هر {days} روز</b> تنظیم شد.",
+                  M([[B("‹ بکاپ و ریستور", "adm:bk")]]))
 
 
 async def handle_signal(update, context, text):
@@ -1729,6 +1973,9 @@ async def handle_signal(update, context, text):
     if price is None:
         await say(update, f"❌ قیمت <code>{esc(parsed['pair'])}</code> از Binance/Bybit پیدا نشد؛ نماد را چک کن.",
                   back_kb())
+        return
+    if err := trading.cancel_check(parsed["entry"], parsed.get("cancel"), price):
+        await say(update, f"❌ {esc(err)}", back_kb())
         return
     parsed["price"] = price
     parsed["order"] = trading.order_type(parsed["side"], parsed["entry"], price)
@@ -1805,7 +2052,7 @@ MAX_BACKUP_MB = 20  # Telegram bots can download files up to 20 MB
 async def on_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
     if ud.get("state") != "restore_wait" or not is_owner(update.effective_user.id):
-        await say(update, "📎 برای ریستور، از 🛡 پنل ادمین ← ▦ بکاپ و ریستور ← ⇧ ریستور بکاپ شروع کن.", home_kb())
+        await say(update, "📎 برای ریستور، از 🛡 پنل ادمین ← ▦ بکاپ و ریستور ← ⇧ ریستور بکاپ شروع کن.", home_kb(update.effective_user.id))
         return
     doc = update.message.document
     if doc.file_size and doc.file_size > MAX_BACKUP_MB * 1024 * 1024:
@@ -1843,7 +2090,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
     uid = update.effective_user.id
 
-    if a == "adm" and len(p) > 1 and p[1] not in ("home", "status", "list") and not is_owner(uid):
+    if a == "adm" and len(p) > 1 and not is_owner(uid):
         await q.answer("⛔ این بخش فقط برای مالک است.", show_alert=True)
         return
     await q.answer()
@@ -1906,6 +2153,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif sub == "bk":
             await reset_flow(ud)
             await view_backup(update)
+        elif sub == "autobackup":
+            settings()["backup_on"] = not settings().get("backup_on", False)
+            save()
+            _reschedule_backup(context.job_queue)
+            await view_backup(update)
+        elif sub == "backupdays":
+            ud["state"] = "set_backup_days"
+            await show(update, "⟳ <b>فاصله‌ی بکاپ خودکار</b>\n\n"
+                               "هر چند روز یک فایل بکاپ SQLite برای مالکان در گفت‌وگوی خصوصی بات ارسال شود؟\n"
+                               "یک عدد بین <b>1</b> تا <b>90</b> بفرست.",
+                       M([[B("✕ انصراف", "adm:bk")]]))
         elif sub == "poll":
             ud["state"] = "set_poll"
             await show(update, "⟳ <b>فاصله‌ی چک قیمت</b>\n\n"
@@ -1920,12 +2178,37 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud["state"] = "adm_add"
             await show(update, "➕ <b>افزودن ادمین</b>\n\nآیدی عددی تلگرام کاربر را بفرست.\n"
                                "(کاربر می‌تواند با /start آیدی خودش را ببیند.)", cancel_kb())
+        elif sub == "u":
+            await view_admin_user(update, int(p[2]))
+        elif sub == "promo":
+            await show(update, f"👑 <b>{who(int(p[2]))}</b> مالک شود؟\n\n"
+                               "مالک می‌تواند ادمین اضافه/حذف کند، بکاپ بگیرد، تاریخچه را پاک کند و بات را ریستارت کند.",
+                       confirm_kb(f"adm:promok:{p[2]}", f"adm:u:{p[2]}", "👑 بله، مالک شود"))
+        elif sub == "promok":
+            aid = int(p[2])
+            ex = settings().setdefault("owners_extra", [])
+            if aid in db()["admins"] and aid not in ex and aid not in ADMIN_IDS:
+                ex.append(aid)
+                save()
+            await view_admin_user(update, aid, "✅ به مالک ارتقا یافت.")
+        elif sub == "demo":
+            await show(update, f"⬇️ <b>{who(int(p[2]))}</b> دوباره ادمین معمولی شود؟\n\n"
+                               "دسترسی مالک و «دیدن معاملات همه» از او گرفته می‌شود.",
+                       confirm_kb(f"adm:demok:{p[2]}", f"adm:u:{p[2]}", "⬇️ بله، آنمالک شود"))
+        elif sub == "demok":
+            aid = int(p[2])
+            if aid not in ADMIN_IDS and aid != uid:
+                st_ = settings()
+                st_["owners_extra"] = [i for i in st_.get("owners_extra", []) if i != aid]
+                st_["see_all"] = [i for i in st_.get("see_all", []) if i != aid]
+                save()
+            await view_admin_user(update, aid, "✅ به ادمین معمولی تبدیل شد.")
         elif sub == "del":
-            await show(update, f"🗑 ادمین <code>{esc(p[2])}</code> حذف شود؟",
-                       confirm_kb(f"adm:delok:{p[2]}", "adm:list"))
+            await show(update, f"🗑 <b>{who(int(p[2]))}</b> از ادمین‌ها حذف شود؟",
+                       confirm_kb(f"adm:delok:{p[2]}", f"adm:u:{p[2]}"))
         elif sub == "delok":
             aid = int(p[2])
-            if aid in db()["admins"]:
+            if aid in db()["admins"] and not is_owner(aid):
                 db()["admins"].remove(aid)
                 save()
             await view_admins(update)
@@ -1972,6 +2255,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     before = restore_backup(Path(f))
                 _reschedule(context.job_queue)
                 _reschedule_auto(context.job_queue)
+                _reschedule_backup(context.job_queue)
             except Exception as ex:
                 log.exception("restore failed")
                 Path(f).unlink(missing_ok=True)
@@ -2052,7 +2336,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show(update, "⌛️ پیش‌نویس منقضی شده؛ سیگنال را دوباره بفرست.", back_kb())
             return
         async with LOCK:
-            t = create_trade(draft, ch)
+            t = create_trade(draft, ch, uid)
             if (settings().get("near_on") and not draft.get("send_now")
                     and not is_near(t, draft["price"])):
                 t["status"] = "waiting"
@@ -2083,7 +2367,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t = get_trade(tid)
         async with LOCK:
             ch = t and get_channel(t["channel"])
-            if not t or not ch:
+            if not t or not ch or not mine(t, uid):
                 await view_trades(update, 0, kind)
                 return
             if p[1] == "pic" and t["status"] == "waiting":
@@ -2118,7 +2402,10 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     risk = trading.risk_of(t)
                     d = 1 if t["side"] == "LONG" else -1
                     if d * (cur - t["entry"]) / risk <= 0:
-                        await q.message.reply_text("قیمت هنوز بالاتر از Entry نیست؛ بریک‌اون ممکن نیست.")
+                        where = "بالاتر" if t["side"] == "LONG" else "پایین‌تر"
+                        await q.message.reply_text(
+                            f"پوزیشن هنوز در سود نیست (قیمت فعلی {fmt_price(cur)} هنوز {where} از "
+                            f"Entry {fmt_price(t['entry'])} نرفته)؛ بریک‌اون ممکن نیست.")
                         return
                     await _link_post(ch, t, "be_set", await _post(ch, trading.be_set_text(t), t["open_msg_id"]))
                     t["be_active"] = True
@@ -2142,6 +2429,18 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- settings ----------
     elif a == "set":
+        if p[1] == "seeall":
+            if not is_owner(uid):
+                await q.answer("⛔ فقط مالک", show_alert=True)
+                return
+            sa = settings().setdefault("see_all", [])
+            if uid in sa:
+                sa.remove(uid)
+            else:
+                sa.append(uid)
+            save()
+            await (view_admins if len(p) > 2 and p[2] == "a" else view_settings)(update)
+            return
         if p[1] == "rewtoggle":
             settings()["reward_on"] = not settings()["reward_on"]
             save()
@@ -2250,7 +2549,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with LOCK:
             for key in keys:
                 ch = get_channel(key)
-                rows = _unreported(key)
+                rows = _unreported(key, uid)
                 if not ch or not rows:
                     continue
                 try:
@@ -2289,11 +2588,22 @@ async def _cancel_on_tp(ch, t, outcome: str = "tp_cancel"):
             except Exception:
                 log.exception("delete pending msg failed for trade %s", t.get("id"))
         if not deleted:
-            mid = await _post(ch, trading.cancel_text(t), msg)
-            await _link_post(ch, t, "cancel", mid)
+            await _post_event(ch, t, "cancel", trading.cancel_text(t), msg)
     t["status"] = "cancelled"
     t["outcome"] = outcome
     t["closed_at"] = datetime.now(timezone.utc).isoformat()
+    save()
+
+
+async def _cancel_on_level(ch, t, cur):
+    """Price passed the signal's Cancel level before Entry was hit: cancel the pending
+    (reply «Cancelled · Price passed Cancel …» under the post; never-posted ones are dropped)."""
+    if t.get("pending_msg_id"):
+        await _post_event(ch, t, "cancel", trading.cancel_level_text(t), t["pending_msg_id"], cur)
+    t["status"] = "cancelled"
+    t["outcome"] = "level_cancel"
+    t["closed_at"] = datetime.now(timezone.utc).isoformat()
+    t["last_price"] = cur
     save()
 
 
@@ -2304,7 +2614,8 @@ async def _cancel_opposite(t):
         return
     for o in trades():
         if (o is t or o["status"] not in ("waiting", "pending") or o["pair"] != t["pair"]
-                or o["channel"] != t["channel"] or o["side"] == t["side"]):
+                or o["channel"] != t["channel"] or o["side"] == t["side"]
+                or o.get("owner") != t.get("owner")):
             continue
         try:
             if o["status"] == "waiting":  # never posted: just drop it
@@ -2329,6 +2640,9 @@ async def _process(t, cur):
     if t["status"] == "waiting":
         e = t["entry"]
         crossed = (prev - e) * (cur - e) <= 0
+        if not crossed and trading.cancel_reached(t, cur):
+            await _cancel_on_level(ch, t, cur)  # never posted: just drop it
+            return
         if not crossed and settings().get("tp_cancel_on") and _tp_reached(t, cur):
             await _cancel_on_tp(ch, t)  # never posted: just drop it
             return
@@ -2346,6 +2660,9 @@ async def _process(t, cur):
     if t["status"] == "pending":
         e = t["entry"]
         if (prev - e) * (cur - e) > 0:
+            if trading.cancel_reached(t, cur):
+                await _cancel_on_level(ch, t, cur)
+                return
             if settings().get("tp_cancel_on") and _tp_reached(t, cur):
                 await _cancel_on_tp(ch, t)
                 return
@@ -2380,7 +2697,14 @@ async def _process(t, cur):
                                   cur, s)
                 t["rewards_hit"].append(s)
                 save()
-        if t["be_after"] and not t["be_active"] and r >= t["be_after"]:
+        if not t["be_active"] and trading.riskfree_reached(t, cur):
+            t["be_active"] = True  # signal's RiskFree level reached: stop moves to Entry
+            await _link_post(ch, t, "be_set", await _post(ch, trading.riskfree_text(t), t["open_msg_id"]))
+            save()
+        # An explicit RiskFree level set on this signal has priority over the
+        # global R-based break-even setting. Wait for that exact price instead.
+        if (t["be_after"] and t.get("riskfree") is None
+                and not t["be_active"] and r >= t["be_after"]):
             t["be_active"] = True
             await _link_post(ch, t, "be_set", await _post(ch, trading.be_set_text(t), t["open_msg_id"]))
             save()
@@ -2436,6 +2760,7 @@ async def post_init(app: Application):
         log.warning("bot profile setup failed: %s", ex)
     _reschedule(app.job_queue)
     _reschedule_auto(app.job_queue)
+    _reschedule_backup(app.job_queue)
     _catchup_auto(app.job_queue)
 
 

@@ -88,6 +88,10 @@ _NUM = r"([\d][\d.,'’_ ]*)"
 _ENTRY = re.compile(r"^(?:int|entry|ent|en)\s*[:=]?\s*" + _NUM + "$", re.I)
 _TP = re.compile(r"^(?:tp|take\s*profit)\s*[:=]?\s*" + _NUM + "$", re.I)
 _SL = re.compile(r"^(?:sl|stop(?:\s*loss)?)\s*[:=]?\s*" + _NUM + "$", re.I)
+# optional: «Cancel» alone (empty) = not set
+_CANCEL = re.compile(r"^(?:cancel|cnl|cn)\s*[:=]?\s*" + _NUM + "?$", re.I)
+# optional: «RiskFree» alone (empty) = not set. Price that moves the stop to Entry.
+_RISKFREE = re.compile(r"^(?:risk\s*-?\s*free|rf|ریسک\s*فری)\s*[:=]?\s*" + _NUM + "?$", re.I)
 
 # Persian / Arabic-Indic digits and separators -> ASCII
 _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫٬", "01234567890123456789.,")
@@ -131,10 +135,14 @@ def normalize_pair(raw: str):
 def parse_signal(text: str):
     text = text.translate(_DIGITS).translate(_JUNK)
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    symbol = entry = tp = sl = None
+    symbol = entry = tp = sl = cancel = riskfree = None
     for line in lines:
         try:
-            if m := _ENTRY.match(line):
+            if m := _RISKFREE.match(line):
+                riskfree = _num(m.group(1)) if m.group(1) else None
+            elif m := _CANCEL.match(line):
+                cancel = _num(m.group(1)) if m.group(1) else None
+            elif m := _ENTRY.match(line):
                 entry = _num(m.group(1))
             elif m := _TP.match(line):
                 tp = _num(m.group(1))
@@ -155,10 +163,62 @@ def parse_signal(text: str):
         side = "SHORT"
     else:
         return "ترتیب قیمت‌ها منطقی نیست (LONG: SL<Entry<TP | SHORT: TP<Entry<SL)."
+    if cancel is not None and abs(cancel - entry) < 1e-12:
+        return "Cancel نباید با Entry برابر باشد."
+    if riskfree is not None and (err := riskfree_check(side, entry, tp, riskfree)):
+        return err
     risk = abs(entry - sl)
     rr = round(abs(tp - entry) / risk, 2)
     return {"pair": pair, "symbol": base, "side": side,
-            "entry": entry, "tp": tp, "sl": sl, "rr": rr}
+            "entry": entry, "tp": tp, "sl": sl, "rr": rr, "cancel": cancel,
+            "riskfree": riskfree}
+
+
+# ====================== Cancel level (optional, per signal) ======================
+# A pending (not filled yet) is cancelled when price passes the Cancel level.
+# Cancel sits on the far side of the market from Entry, e.g. LONG limit:
+#   Entry 81,000 < market 82,500 < Cancel 84,000  → price reaches 84,000 first → cancelled.
+# Direction = side of Cancel relative to Entry, so it works for limit and stop orders alike.
+
+def cancel_check(entry: float, cancel, price: float):
+    """Error text if `cancel` is not usable at market `price`, else None."""
+    if cancel is None:
+        return None
+    if abs(cancel - entry) < 1e-12:
+        return "Cancel نباید با Entry برابر باشد."
+    if (cancel - price) * (entry - price) >= 0:
+        return (f"Cancel باید آن طرف قیمت فعلی ({fmt_price(price)}) باشد، نه بین قیمت و Entry "
+                f"(وگرنه قبل از رسیدن به Entry کنسل می‌شود).")
+    return None
+
+
+def cancel_reached(t, price: float) -> bool:
+    c = t.get("cancel")
+    if c is None:
+        return False
+    return price >= c if c > t["entry"] else price <= c
+
+
+# ====================== RiskFree level (optional, per signal) ======================
+# When an open position reaches the RiskFree price, the stop moves to Entry (Risk-free🌱).
+# It must sit between Entry and TP: LONG Entry < RiskFree < TP | SHORT TP < RiskFree < Entry.
+
+def riskfree_check(side: str, entry: float, tp: float, rf):
+    """Error text if `rf` is not between Entry and TP, else None."""
+    if rf is None:
+        return None
+    if side == "LONG" and not entry < rf < tp:
+        return "RiskFree باید بین Entry و TP باشد (LONG: Entry < RiskFree < TP)."
+    if side == "SHORT" and not tp < rf < entry:
+        return "RiskFree باید بین TP و Entry باشد (SHORT: TP < RiskFree < Entry)."
+    return None
+
+
+def riskfree_reached(t, price: float) -> bool:
+    rf = t.get("riskfree")
+    if rf is None:
+        return False
+    return price >= rf if t["side"] == "LONG" else price <= rf
 
 
 # ====================== Live prices (Binance / Bybit public API) ======================
@@ -236,7 +296,9 @@ def pending_text(t, when: datetime = None):
         f"Entry   {fmt_price(t['entry'])}\n"
         f"TP   {fmt_price(t['tp'])}\n"
         f"SL   {fmt_price(t['sl'])}\n"
-        f"R/R   {fmt_rr(t['rr'])}\n"
+        + (f"Cancel   {fmt_price(t['cancel'])}\n" if t.get("cancel") is not None else "")
+        + (f"RiskFree   {fmt_price(t['riskfree'])}\n" if t.get("riskfree") is not None else "")
+        + f"R/R   {fmt_rr(t['rr'])}\n"
         f"{LINE}\n"
         f"{fa_datetime(when)}"
     )
@@ -250,6 +312,12 @@ def open_text(t):
 
 def cancel_text(t):
     return f"Position {t['no']}  ·  Cancelled🚫"
+
+
+def cancel_level_text(t):
+    """Reply when price passed the Cancel level before the pending was filled."""
+    return (f"Position {t['no']}  ·  Cancelled🚫\n"
+            f"<i>Price passed Cancel {fmt_price(t['cancel'])}</i>")
 
 
 def reward_text(t, step):
@@ -283,6 +351,12 @@ def be_set_text(t):
     return f"Position {t['no']}  ·  Risk-free🌱"
 
 
+def riskfree_text(t):
+    """Reply when price reached the signal's RiskFree level: SL moved to Entry."""
+    return (f"Position {t['no']}  ·  Risk-free🌱\n"
+            f"<i>Price reached RiskFree {fmt_price(t['riskfree'])} · SL → Entry</i>")
+
+
 def manual_text(t):
     return f"Position {t['no']}  ·  Closed at <b>{fmt_r(t['result_r'])}</b>✋"
 
@@ -305,7 +379,11 @@ def stop_r(t, sl=None) -> float:
     return d * ((t["sl"] if sl is None else sl) - t["entry"]) / risk_of(t)
 
 
-_FIELD = {"entry": "Entry", "tp": "TP", "sl": "SL"}
+_FIELD = {"entry": "Entry", "tp": "TP", "sl": "SL", "cancel": "Cancel", "riskfree": "RiskFree"}
+
+
+def _fp(x) -> str:
+    return "—" if x is None else fmt_price(x)
 
 
 def _stop_note(old_r: float, new_r: float) -> str:
@@ -320,7 +398,7 @@ def _stop_note(old_r: float, new_r: float) -> str:
 
 def edit_pending_text(t, changes, old_rr):
     """Reply under a pending post that was corrected. changes = [(field, old, new), ...]"""
-    rows = [f"{_FIELD[f]}   {fmt_price(o)} → <b>{fmt_price(n)}</b>" for f, o, n in changes]
+    rows = [f"{_FIELD[f]}   {_fp(o)} → <b>{_fp(n)}</b>" for f, o, n in changes]
     if abs(old_rr - t["rr"]) > 0.004:
         rows.append(f"R/R   {fmt_rr(old_rr)} → <b>{fmt_rr(t['rr'])}</b>")
     return (f"Position {t['no']}  ·  Edited✏️\n"
@@ -332,7 +410,7 @@ def edit_open_text(t, changes, old_rr, old_stop_r):
     """Reply under an open position whose SL / TP was moved."""
     rows = []
     for f, o, n in changes:
-        line = f"{_FIELD[f]}   {fmt_price(o)} → <b>{fmt_price(n)}</b>"
+        line = f"{_FIELD[f]}   {_fp(o)} → <b>{_fp(n)}</b>"
         if f == "sl":
             line += f"\n<i>{_stop_note(old_stop_r, stop_r(t))}</i>"
         elif f == "tp":
@@ -340,8 +418,7 @@ def edit_open_text(t, changes, old_rr, old_stop_r):
             line += (f"\n<i>{'Target extended🔺' if grew else 'Target reduced🔻'}"
                      f" · R/R {fmt_rr(old_rr)} → {fmt_rr(t['rr'])}</i>")
         rows.append(line)
-    title = "SL Updated" if [c[0] for c in changes] == ["sl"] else (
-        "TP Updated" if [c[0] for c in changes] == ["tp"] else "SL / TP Updated")
+    title = " / ".join(_FIELD[c[0]] for c in changes) + " Updated"
     return f"Position {t['no']}  ·  {title}✏️\n{LINE}\n" + "\n".join(rows)
 
 

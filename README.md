@@ -156,7 +156,13 @@ btc
 Int81000
 Tp87000
 Sl80000
+Cancel84000
+RiskFree83000
 ```
+
+`Cancel` is optional (leave it empty or drop the line to disable). It must sit on the far side of the market from Entry, otherwise the bot rejects the signal.
+
+`RiskFree` is optional too (leave it empty or drop the line to disable). It must sit between Entry and TP (LONG: Entry < RiskFree < TP, SHORT: TP < RiskFree < Entry). When an open position reaches it, the stop moves to Entry and the bot replies **Risk-free🌱 · Price reached RiskFree …**. Edit it from the trade list (pending or open, until it fires); `RiskFree0` removes it.
 
 5. A preview appears (Risk/Reward is calculated automatically). Choose the channel and the signal is posted.
 
@@ -165,6 +171,8 @@ Sl80000
 - 🟡 **Pending** is posted.
 - Price reaches Entry → **Position Opened** (reply to the Pending post).
 - Cancel from Active Trades → **Pending Order Cancelled** (reply to the same post).
+- Price passes the signal's `Cancel` level before Entry is hit → **Cancelled · Price passed Cancel …** (reply to the Pending post; a waiting signal that was never posted is dropped silently). Edit it from the trade list like Int/Tp/Sl, `Cancel0` removes it.
+- Open position reaches the signal's `RiskFree` level → **Risk-free🌱** (SL moved to Entry; a later return to Entry closes at 0R).
 - Price reaches a reward step (configurable) → **Reward 1R reached — In Profit**.
 - Price reaches TP or SL → result post with the final R.
 - **Report Post** → summary with each trade result, total R, win rate and collected rewards.
@@ -180,6 +188,10 @@ Channels, open positions, trade history, admins and settings are stored in a SQL
 - **Time**: pick a preset or send any `HH:MM`.
 - **Condition**: *Always* (whenever trades were closed that day) or *Profitable days only* (skipped when the day's total R is not positive).
 - If the bot was offline at the scheduled time, the report is sent shortly after it starts.
+
+## Automatic Database Backup
+
+**Admin Panel → ▦ Backup and Restore → 🔔 Automatic Backup** sends a consistent SQLite backup file to every owner in their private chat with the bot. Choose an interval from **1 to 90 days**; the first backup is sent shortly after enabling it, and later backups follow the configured interval. The feature stores its schedule in the database and resumes automatically after restarts.
 
 ## Live Price
 
